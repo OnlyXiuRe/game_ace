@@ -1,13 +1,22 @@
 /*
- * feat_usb.c - USB 特性模块 (第一个 feature)
+ * usb_audit.c - USB 设备审计模块 (game_base 的第一个核心模块)
  *
- * 职责:
- *   1. 解析 \Driver\USBHUB3, 安装 IRP_MJ_PNP hook
- *   2. PnP 事件里记录设备 (VID/PID/REV)
- *   3. 提供 ENUM / CTRL(原始 URB) / BLOCK / DEBUG 四个 IOCTL
- *   4. 解析失败时枚举 \Driver 目录, 打印含 HUB 的对象名 (排查用)
+ * ==================================================================
+ * 职责
+ * ==================================================================
+ *   1. 锚定 \Driver\USBHUB3, 拿 DRIVER_OBJECT
+ *   2. 替换它的 MajorFunction[IRP_MJ_PNP], 拦截 START/REMOVE 事件
+ *   3. 走 DeviceObject->NextDevice 链表 + IoGetLowerDeviceObject 设备栈
+ *   4. 提供 ENUM / CTRL(原始 URB) / BLOCK / DEBUG 四个 IOCTL
  *
- * 后续加新 feature 时, 照这个文件写一个 feat_xxx.c + 一个 MODULE_DESC 即可。
+ * ==================================================================
+ * 对齐 ACE 的发现路径 (来自 IDA)
+ * ==================================================================
+ *   ACE sub_14000F600:  ObReferenceObjectByName(L"\\Driver\\USBHUB3")
+ *   ACE sub_14000E630:  DriverObject->DeviceObject -> NextDevice 遍历
+ *   ACE 字符串:         "UsbHub Stack: %ws %p DriverName: %ws"
+ *   ACE sub_140086760:  InterlockedExchange64(&DrvObj->MajorFunction[27])
+ *   ACE sub_14000E840:  伪造 PNP IRP 封锁设备
  */
 #include "module.h"
 #include "game_base.h"
@@ -15,44 +24,24 @@
 #include <usbdlib.h>
 #include <usbioctl.h>
 #include <ntstrsafe.h>
-#include <initguid.h>
 
 #define USB_MOD "usb"
-
-/* 支持的 hub 驱动名 (按优先级) */
-static const WCHAR *g_HubDriverNames[] = {
-    L"\\Driver\\USBHUB3",     /* USB 3.0 hub (xHCI) */
-    L"\\Driver\\usbhub",      /* USB 2.0 hub (EHCI/OHCI/UHCI) */
-};
 
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #endif
 
-/* WDK 未声明, 手动补 */
-typedef struct _OBJECT_DIRECTORY_INFORMATION {
-    UNICODE_STRING Name;
-    UNICODE_STRING TypeName;
-} OBJECT_DIRECTORY_INFORMATION, *POBJECT_DIRECTORY_INFORMATION;
-
-NTSYSAPI NTSTATUS NTAPI ZwOpenDirectoryObject(PHANDLE DirectoryHandle,
-                                              ACCESS_MASK DesiredAccess,
-                                              POBJECT_ATTRIBUTES ObjectAttributes);
-NTSYSAPI NTSTATUS NTAPI ZwQueryDirectoryObject(HANDLE DirectoryHandle,
-                                               PVOID Buffer,
-                                               ULONG BufferLength,
-                                               BOOLEAN ReturnSingleEntry,
-                                               BOOLEAN RestartScan,
-                                               PULONG Context,
-                                               PULONG ReturnLength);
-
-DEFINE_GUID(GUID_DEVINTERFACE_USB_DEVICE,
-    0xA5DCBF10, 0x6530, 0x11D2, 0x90, 0x1F, 0x00, 0xC0, 0x4F, 0xB9, 0x51, 0xED);
+/* WDK 的 ntddk.h 里没有这些声明, 手动补 */
+extern PDEVICE_OBJECT IoGetLowerDeviceObject(PDEVICE_OBJECT DeviceObject);
 
 /* ================= 状态 ================= */
+
+/*
+ * TRACKED_DEV - 一个被跟踪的 USB 设备
+ */
 typedef struct _TRACKED_DEV {
-    PDEVICE_OBJECT DeviceObject;
-    USHORT  Vid, Pid, BcdDevice;
+    PDEVICE_OBJECT DeviceObject;        /* 设备对象 */
+    USHORT  Vid, Pid, BcdDevice;        /* 从 hardware id 解析 */
     USHORT  BusNumber;
     ULONG   DeviceAddress;
     BOOLEAN Active;
@@ -62,25 +51,41 @@ typedef struct _TRACKED_DEV {
 
 static KSPIN_LOCK     g_Lock;
 static TRACKED_DEV    g_Devs[USB_MAX_DEVICES];
-static volatile LONG  g_Unloading = 0;
-static volatile LONG  g_InHook = 0;
+
+/*
+ * HUB_SLOT - 一个 hub 驱动的 hook 槽
+ */
+typedef struct _HUB_SLOT {
+    HOOK_ENTRY      Hook;               /* hook 框架的条目 */
+    PDRIVER_OBJECT  Driver;             /* hub 的驱动对象 (带引用) */
+    ULONG           DeviceCount;        /* 该驱动的设备数 */
+    ULONG           MaxStackDepth;      /* 最深设备栈 */
+} HUB_SLOT;
+
+static HUB_SLOT       g_HubSlot;
+static BOOLEAN        g_HubSlotUsed = FALSE;
+
+static volatile LONG  g_Unloading = 0;   /* 卸载标记 */
+static volatile LONG  g_InHook    = 0;   /* 正在 hook 回调里的线程数 */
 static ULONG          g_HookStatus = 0xFFFFFFFF;
-static ULONG          g_HubFound = 0;
-static ULONG          g_Tracked = 0;
-static ULONG          g_ScanCount = 0;
+static ULONG          g_HubFound   = 0;
+static ULONG          g_Tracked    = 0;
+static ULONG          g_ScanCount  = 0;
 static ULONG          g_ScanStatus = 0xFFFFFFFF;
 
-/* 前向声明 */
-static NTSTATUS UsbAuditDispatch(PVOID buffer, ULONG inLen, ULONG outLen, ULONG code, PULONG info);
+/* ================= 前向声明 ================= */
+static NTSTATUS UsbAuditDispatch(PVOID buffer, ULONG inLen, ULONG outLen,
+                                 ULONG code, PULONG info);
 static NTSTATUS MyHubPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp);
-static VOID     EnumExistingDevices(VOID);
-static VOID     DumpDriverDirectory(VOID);
+static VOID     EnumAllUsbHubs(VOID);
 static NTSTATUS DoEnum(PVOID buffer, ULONG outLen, PULONG info);
 static NTSTATUS DoCtrl(PVOID buffer, ULONG inLen, PULONG info);
 static NTSTATUS DoBlock(PVOID buffer, ULONG inLen);
 static NTSTATUS DoDebug(PVOID buffer, ULONG outLen, PULONG info);
 
 /* ================= 工具 ================= */
+
+/* 解析 4 位十六进制 */
 static BOOLEAN ParseHex4(const WCHAR *p, PUSHORT out)
 {
     USHORT v = 0;
@@ -96,6 +101,7 @@ static BOOLEAN ParseHex4(const WCHAR *p, PUSHORT out)
     return TRUE;
 }
 
+/* 从 HardwareID 解析 VID/PID/REV */
 static BOOLEAN ParseHid(const WCHAR *hid, PUSHORT vid, PUSHORT pid, PUSHORT rev)
 {
     *vid = *pid = *rev = 0;
@@ -107,23 +113,33 @@ static BOOLEAN ParseHid(const WCHAR *hid, PUSHORT vid, PUSHORT pid, PUSHORT rev)
     return (*vid != 0 || *pid != 0);
 }
 
+/*
+ * QueryDeviceId - 从设备对象读 HardwareID 并解析 VID/PID
+ *
+ * 注意: hub 的 FDO 通常没有 HardwareID 属性, 需要传底层 PDO。
+ */
 static BOOLEAN QueryDeviceId(PDEVICE_OBJECT devObj, PUSHORT vid, PUSHORT pid,
                              PUSHORT rev, PWCHAR hidOut, ULONG hidChars)
 {
     WCHAR buf[512];
     ULONG len = 0;
+    NTSTATUS st;
+
     RtlZeroMemory(buf, sizeof(buf));
-    NTSTATUS st = IoGetDeviceProperty(devObj, DevicePropertyHardwareID,
-                                      sizeof(buf) - sizeof(WCHAR), buf, &len);
+    st = IoGetDeviceProperty(devObj, DevicePropertyHardwareID,
+                             sizeof(buf) - sizeof(WCHAR), buf, &len);
     if (!NT_SUCCESS(st) || len < 10) {
         LOG_WARN("IoGetDeviceProperty dev=%p -> %08X len=%lu", devObj, st, len);
         return FALSE;
     }
+
     buf[(sizeof(buf)/sizeof(WCHAR)) - 1] = 0;
+
     if (!ParseHid(buf, vid, pid, rev)) {
         LOG_WARN("hardware id parse failed");
         return FALSE;
     }
+
     if (hidOut && hidChars) {
         ULONG i = 0;
         for (; buf[i] && i + 1 < hidChars; i++) hidOut[i] = buf[i];
@@ -132,6 +148,7 @@ static BOOLEAN QueryDeviceId(PDEVICE_OBJECT devObj, PUSHORT vid, PUSHORT pid,
     return TRUE;
 }
 
+/* 在设备表里按设备对象查找 */
 static TRACKED_DEV *FindDev(PDEVICE_OBJECT devObj)
 {
     for (int i = 0; i < USB_MAX_DEVICES; i++)
@@ -139,11 +156,17 @@ static TRACKED_DEV *FindDev(PDEVICE_OBJECT devObj)
     return NULL;
 }
 
+/*
+ * TrackDevice - 记录一个 USB 设备
+ */
 static VOID TrackDevice(PDEVICE_OBJECT devObj)
 {
     USHORT vid = 0, pid = 0, rev = 0;
     WCHAR hid[128];
     KIRQL irql;
+
+    if (devObj == NULL) return;
+
     RtlZeroMemory(hid, sizeof(hid));
     if (!QueryDeviceId(devObj, &vid, &pid, &rev, hid, 128)) return;
 
@@ -153,7 +176,9 @@ static VOID TrackDevice(PDEVICE_OBJECT devObj)
             if (!g_Devs[i].Active) {
                 RtlZeroMemory(&g_Devs[i], sizeof(TRACKED_DEV));
                 g_Devs[i].DeviceObject = devObj;
-                g_Devs[i].Vid = vid; g_Devs[i].Pid = pid; g_Devs[i].BcdDevice = rev;
+                g_Devs[i].Vid = vid;
+                g_Devs[i].Pid = pid;
+                g_Devs[i].BcdDevice = rev;
                 g_Devs[i].Active = TRUE;
                 RtlStringCchCopyW(g_Devs[i].HardwareId, 128, hid);
                 g_Tracked++;
@@ -162,9 +187,11 @@ static VOID TrackDevice(PDEVICE_OBJECT devObj)
         }
     }
     KeReleaseSpinLock(&g_Lock, irql);
+
     LOG_INFO("START dev=%p VID=%04X PID=%04X REV=%04X", devObj, vid, pid, rev);
 }
 
+/* 移除一个设备记录 */
 static VOID UntrackDevice(PDEVICE_OBJECT devObj)
 {
     KIRQL irql;
@@ -176,21 +203,12 @@ static VOID UntrackDevice(PDEVICE_OBJECT devObj)
 }
 
 /* ================= PnP Hook ================= */
+
 /*
  * FindOrigByDevice - 从设备对象反查它所属 hub 的原始 PnP 派发函数
  *
- * 多 hub 场景下无法用单个全局 Original, 必须按 DriverObject 找对应 slot。
- * 调用时 IRQL 可能是 DISPATCH_LEVEL, 用自旋锁保护。
+ * 多 hub 场景下无法用单个全局 Original, 必须按 DriverObject 找对应槽。
  */
-/* 每个 hub 驱动一个 hook 槽 */
-typedef struct _HUB_SLOT {
-    HOOK_ENTRY      Hook;
-    PDRIVER_OBJECT  Driver;
-    ULONG           DeviceCount;
-} HUB_SLOT;
-
-static HUB_SLOT  g_HubSlots[ARRAY_SIZE(g_HubDriverNames)];
-static ULONG     g_HubSlotCount = 0;
 static PDRIVER_DISPATCH FindOrigByDevice(PDEVICE_OBJECT DeviceObject)
 {
     PDRIVER_OBJECT   drv;
@@ -202,11 +220,8 @@ static PDRIVER_DISPATCH FindOrigByDevice(PDEVICE_OBJECT DeviceObject)
     if (drv == NULL) return NULL;
 
     KeAcquireSpinLock(&g_Lock, &irql);
-    for (ULONG i = 0; i < g_HubSlotCount; i++) {
-        if (g_HubSlots[i].Driver == drv) {
-            orig = (PDRIVER_DISPATCH)g_HubSlots[i].Hook.Original;
-            break;
-        }
+    if (g_HubSlotUsed && g_HubSlot.Driver == drv) {
+        orig = (PDRIVER_DISPATCH)g_HubSlot.Hook.Original;
     }
     KeReleaseSpinLock(&g_Lock, irql);
 
@@ -214,10 +229,9 @@ static PDRIVER_DISPATCH FindOrigByDevice(PDEVICE_OBJECT DeviceObject)
 }
 
 /*
- * MyHubPnp - 所有 hub 共用的 PnP 拦截函数
+ * MyHubPnp - hub 的 IRP_MJ_PNP 拦截函数
  *
- * 因为多个 hub 驱动都指向同一个 handler, 必须靠 DeviceObject->DriverObject
- * 反查当前是哪个 hub, 才能拿到正确的原始派发函数。
+ * 拦截 START_DEVICE / REMOVE_DEVICE, 记录设备, 然后尾调用原派发函数。
  */
 static NTSTATUS MyHubPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
@@ -232,7 +246,6 @@ static NTSTATUS MyHubPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     orig  = FindOrigByDevice(DeviceObject);
 
     if (orig == NULL) {
-        /* 找不到原函数: 说明 hook 已被卸但 IRP 还在飞, 直接完成避免蓝屏 */
         LOG_WARN("MyHubPnp: no original dispatch for device %p", DeviceObject);
         Irp->IoStatus.Status      = STATUS_DEVICE_NOT_READY;
         Irp->IoStatus.Information = 0;
@@ -250,106 +263,180 @@ static NTSTATUS MyHubPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     return orig(DeviceObject, Irp);
 }
 
-/* ================= \Driver 目录枚举 (排查) ================= */
-static VOID DumpDriverDirectory(VOID)
+/* ================= 设备栈遍历 ================= */
+
+/*
+ * WalkDeviceStack - 从某个设备沿设备栈向下走, 打印每一层的驱动名
+ *
+ * 参数:
+ *   top    起始设备 (hub 的 FDO)
+ *   depth  输出: 栈深度
+ *
+ * 返回: 最底层设备 (PDO), 调用方负责 ObDereferenceObject
+ *
+ * IoGetLowerDeviceObject 每次返回都带一个引用, 除了起始设备,
+ * 每一层用完都要释放。
+ */
+static PDEVICE_OBJECT WalkDeviceStack(PDEVICE_OBJECT top, PULONG depth)
 {
-    UNICODE_STRING dirName;
-    OBJECT_ATTRIBUTES oa;
-    HANDLE hDir = NULL;
-    NTSTATUS st;
+    PDEVICE_OBJECT cur = top;
+    PDEVICE_OBJECT bottom = NULL;
+    ULONG          d = 0;
 
-    RtlInitUnicodeString(&dirName, L"\\Driver");
-    InitializeObjectAttributes(&oa, &dirName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    if (top == NULL) { *depth = 0; return NULL; }
 
-    st = ZwOpenDirectoryObject(&hDir, DIRECTORY_QUERY, &oa);
-    if (!NT_SUCCESS(st)) {
-        LOG_ERROR("ZwOpenDirectoryObject(\\Driver) -> %08X", st);
+    while (cur != NULL) {
+        PDRIVER_OBJECT drv = cur->DriverObject;
+
+        if (drv != NULL && drv->DriverName.Buffer != NULL) {
+            LOG_INFO("    [stack %lu] dev=%p driver=%wZ", d, cur, &drv->DriverName);
+        } else {
+            LOG_INFO("    [stack %lu] dev=%p driver=<none>", d, cur);
+        }
+
+        bottom = cur;
+        cur = IoGetLowerDeviceObject(cur);
+
+        /* 起始设备不释放, 中间层释放 */
+        if (bottom != top) {
+            ObDereferenceObject(bottom);
+        }
+        d++;
+    }
+
+    *depth = d;
+    return (bottom == top) ? NULL : bottom;
+}
+
+/*
+ * EnumAllUsbHubs - 按 ACE 的路径枚举所有 hub 并装 hook
+ *
+ * 步骤 (和 ACE 一致):
+ *   1. 锚定 \Driver\USBHUB3 → 拿 DRIVER_OBJECT
+ *   2. 走 DeviceObject->NextDevice → 所有 hub 设备实例
+ *   3. 对每个设备 IoGetLowerDeviceObject → 设备栈
+ *   4. 装 IRP_MJ_PNP hook
+ */
+static VOID EnumAllUsbHubs(VOID)
+{
+    PDRIVER_OBJECT  drv = NULL;
+    NTSTATUS        st;
+    ULONG           devCount = 0;
+    ULONG           maxDepth = 0;
+
+    /* ---- 第 1 步: 锚定 USBHUB3 ---- */
+    st = DriverLookupByName(L"\\Driver\\USBHUB3", &drv);
+    g_HookStatus = (ULONG)st;
+
+    if (!NT_SUCCESS(st) || drv == NULL) {
+        LOG_ERROR("USBHUB3 driver not found: %08X", st);
         return;
     }
 
-    ULONG bufSize = 8192;
-    PVOID buf = ExAllocatePoolWithTag(NonPagedPool, bufSize, 'gniD');
-    if (buf == NULL) { ZwClose(hDir); return; }
+    LOG_INFO("found USBHUB3: DrvObj=%p Start=%p Size=%lu FirstDevice=%p",
+             drv, drv->DriverStart, drv->DriverSize, drv->DeviceObject);
 
-    ULONG ctx = 0, total = 0, hit = 0;
-    for (;;) {
-        ULONG retLen = 0;
-        st = ZwQueryDirectoryObject(hDir, buf, bufSize, TRUE, FALSE, &ctx, &retLen);
-        if (!NT_SUCCESS(st)) break;
+    /* ---- 第 2 步: 走设备链 ---- */
+    for (PDEVICE_OBJECT dev = drv->DeviceObject; dev != NULL; dev = dev->NextDevice) {
+        ULONG          depth  = 0;
+        PDEVICE_OBJECT bottom;
 
-        POBJECT_DIRECTORY_INFORMATION info = (POBJECT_DIRECTORY_INFORMATION)buf;
-        for (; info->Name.Length != 0; info++) {
-            total++;
-            USHORT nchars = info->Name.Length / sizeof(WCHAR);
-            BOOLEAN match = FALSE;
-            for (USHORT i = 0; i + 2 < nchars; i++) {
-                WCHAR c = info->Name.Buffer[i];
-                if (c == L'H' || c == L'h') {
-                    WCHAR c1 = info->Name.Buffer[i+1], c2 = info->Name.Buffer[i+2];
-                    if ((c1 == L'U' || c1 == L'u') && (c2 == L'B' || c2 == L'b')) {
-                        match = TRUE; break;
-                    }
-                }
-            }
-            if (!match) continue;
-            hit++;
-            ANSI_STRING ansi;
-            CHAR tmp[128];
-            ansi.Buffer = tmp;
-            ansi.MaximumLength = sizeof(tmp) - 1;
-            ansi.Length = 0;
-            if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansi, &info->Name, FALSE))) {
-                tmp[ansi.Length] = 0;
-                LOG_INFO("\\Driver\\%s", tmp);
-            }
+        LOG_INFO("  hub device #%lu: %p", devCount, dev);
+
+        /* ---- 第 3 步: 沿设备栈向下 ---- */
+        bottom = WalkDeviceStack(dev, &depth);
+        if (depth > maxDepth) maxDepth = depth;
+
+        /* 底层是 PDO, 从它读 HardwareID */
+        if (bottom != NULL) {
+            TrackDevice(bottom);
+            ObDereferenceObject(bottom);
+        } else {
+            TrackDevice(dev);
         }
+
+        devCount++;
     }
 
-    LOG_INFO("\\Driver total=%lu matched(HUB)=%lu", total, hit);
-    ExFreePool(buf);
-    ZwClose(hDir);
+    g_ScanCount = devCount;
+
+    /* ---- 第 4 步: 装 PnP hook ---- */
+    if (!g_HubSlotUsed) {
+        RtlZeroMemory(&g_HubSlot, sizeof(g_HubSlot));
+        st = HookInstall(&g_HubSlot.Hook, HOOK_DISPATCH, drv, MyHubPnp, IRP_MJ_PNP);
+
+        if (NT_SUCCESS(st)) {
+            g_HubSlot.Driver        = drv;
+            g_HubSlot.DeviceCount   = devCount;
+            g_HubSlot.MaxStackDepth = maxDepth;
+            g_HubSlotUsed           = TRUE;
+            g_HubFound              = 1;
+
+            LOG_INFO("hook USBHUB3 ok: devices=%lu maxStackDepth=%lu orig=%p",
+                     devCount, maxDepth, g_HubSlot.Hook.Original);
+        } else {
+            LOG_ERROR("hook USBHUB3 failed: %08X", st);
+            ObDereferenceObject(drv);
+        }
+    }
 }
 
 /* ================= URB / Block ================= */
+
+/*
+ * SubmitUrb - 向某个设备提交一个 URB
+ */
 static NTSTATUS SubmitUrb(PDEVICE_OBJECT target, URB *urb)
 {
-    KEVENT event;
+    KEVENT          event;
     IO_STATUS_BLOCK iosb;
-    PDEVICE_OBJECT top;
-    NTSTATUS st;
+    PDEVICE_OBJECT  top;
+    NTSTATUS        st;
 
     top = IoGetAttachedDeviceReference(target);
     if (top == NULL) return STATUS_UNSUCCESSFUL;
 
     KeInitializeEvent(&event, NotificationEvent, FALSE);
     RtlZeroMemory(&iosb, sizeof(iosb));
+
     PIRP irp = IoBuildDeviceIoControlRequest(IOCTL_INTERNAL_USB_SUBMIT_URB, top,
                                              urb, sizeof(URB), NULL, 0, TRUE, &event, &iosb);
-    if (irp == NULL) { ObDereferenceObject(top); return STATUS_INSUFFICIENT_RESOURCES; }
+    if (irp == NULL) {
+        ObDereferenceObject(top);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
 
     st = IofCallDriver(top, irp);
     if (st == STATUS_PENDING) {
         KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
         st = iosb.Status;
     }
+
     ObDereferenceObject(top);
     return st;
 }
 
+/*
+ * BlockDevice - 伪造 PNP IRP 封锁/解封设备 (ACE 的做法)
+ */
 static NTSTATUS BlockDevice(PDEVICE_OBJECT target, BOOLEAN block)
 {
-    KEVENT event;
+    KEVENT          event;
     IO_STATUS_BLOCK iosb;
-    PDEVICE_OBJECT top;
-    NTSTATUS st;
+    PDEVICE_OBJECT  top;
+    NTSTATUS        st;
 
     top = IoGetAttachedDeviceReference(target);
     if (top == NULL) return STATUS_UNSUCCESSFUL;
 
     KeInitializeEvent(&event, NotificationEvent, FALSE);
     RtlZeroMemory(&iosb, sizeof(iosb));
+
     PIRP irp = IoBuildSynchronousFsdRequest(IRP_MJ_PNP, top, NULL, 0, NULL, &event, &iosb);
-    if (irp == NULL) { ObDereferenceObject(top); return STATUS_INSUFFICIENT_RESOURCES; }
+    if (irp == NULL) {
+        ObDereferenceObject(top);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
 
     PIO_STACK_LOCATION sl = IoGetNextIrpStackLocation(irp);
     sl->MinorFunction = block ? IRP_MN_STOP_DEVICE : IRP_MN_START_DEVICE;
@@ -360,134 +447,72 @@ static NTSTATUS BlockDevice(PDEVICE_OBJECT target, BOOLEAN block)
         KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
         st = iosb.Status;
     }
+
     ObDereferenceObject(top);
     return st;
 }
 
-/* ================= 枚举已存在设备 ================= */
-/* ==================================================================
- * 枚举所有 USB hub (参考 ACE 的 Enum GetAllUsbHub)
- * ==================================================================
- * 和 ACE 的差异:
- *   ACE: 先 GetUsbHub 找出所有 hub 设备, 再逐个 hook
- *   我们: 先按驱动名找 hub 驱动对象, 再走 DeviceObject->NextDevice 链表
- *
- * 为什么要枚举所有 hub:
- *   一个系统可能有多个 hub 实例 (xHCI 根 hub + 外接 hub + USB2 的老 hub),
- *   只 hook USBHUB3 会漏掉 USB 2.0 总线上的设备。
- *
- * 链表结构 (DRIVER_OBJECT 里):
- *   DriverObject->DeviceObject  →  该驱动的第一个设备
- *   DEVICE_OBJECT->NextDevice   →  同驱动的下一个设备
- */
+/* ================= IOCTL 处理 ================= */
 
-
-
-
-
-/*
- * EnumAllUsbHubs - 遍历所有 hub 驱动, 走设备链, 装 PnP hook
- *
- * 返回: 成功挂钩的 hub 驱动数量
- */
-static ULONG EnumAllUsbHubs(VOID)
-{
-    ULONG hooked = 0;
-
-    for (ULONG i = 0; i < ARRAY_SIZE(g_HubDriverNames); i++) {
-        PDRIVER_OBJECT drv = NULL;
-        NTSTATUS       st;
-
-        st = DriverLookupByName(g_HubDriverNames[i], &drv);
-        if (!NT_SUCCESS(st) || drv == NULL) {
-            LOG_INFO("hub driver %ws not found (%08X)", g_HubDriverNames[i], st);
-            continue;
-        }
-
-        LOG_INFO("found hub driver %ws -> %p (DriverObject)", g_HubDriverNames[i], drv);
-        LOG_INFO("  DriverStart=%p Size=%lu DeviceObject=%p",
-                 drv->DriverStart, drv->DriverSize, drv->DeviceObject);
-
-        /* ---- 走这个驱动的设备链 ---- */
-        ULONG devCount = 0;
-        for (PDEVICE_OBJECT dev = drv->DeviceObject; dev != NULL; dev = dev->NextDevice) {
-            LOG_INFO("  hub device #%lu: %p (Driver %ws)",
-                     devCount, dev, g_HubDriverNames[i]);
-            TrackDevice(dev);
-            devCount++;
-        }
-        g_ScanCount += devCount;
-
-        /* ---- 装 PnP hook ---- */
-        if (g_HubSlotCount < ARRAY_SIZE(g_HubSlots)) {
-            HUB_SLOT *slot = &g_HubSlots[g_HubSlotCount];
-
-            RtlZeroMemory(slot, sizeof(*slot));
-            st = HookInstall(&slot->Hook, HOOK_DISPATCH, drv, MyHubPnp, IRP_MJ_PNP);
-
-            if (NT_SUCCESS(st)) {
-                slot->Driver      = drv;
-                slot->DeviceCount = devCount;
-                g_HubSlotCount++;
-                hooked++;
-                LOG_INFO("hook %ws ok (devices=%lu, orig=%p)",
-                         g_HubDriverNames[i], devCount, slot->Hook.Original);
-            } else {
-                LOG_ERROR("hook %ws failed: %08X", g_HubDriverNames[i], st);
-                ObDereferenceObject(drv);
-            }
-        } else {
-            LOG_WARN("hub slot table full, skip %ws", g_HubDriverNames[i]);
-            ObDereferenceObject(drv);
-        }
-    }
-
-    return hooked;
-}
-
-/* ================= IOCTL ================= */
 static NTSTATUS DoEnum(PVOID buffer, ULONG outLen, PULONG info)
 {
+    USB_DEV_LIST *out;
+    KIRQL         irql;
+    ULONG         n = 0;
+
     if (buffer == NULL || outLen < sizeof(USB_DEV_LIST)) return STATUS_BUFFER_TOO_SMALL;
-    USB_DEV_LIST *out = (USB_DEV_LIST *)buffer;
-    KIRQL irql;
+
+    out = (USB_DEV_LIST *)buffer;
     RtlZeroMemory(out, sizeof(USB_DEV_LIST));
 
     KeAcquireSpinLock(&g_Lock, &irql);
-    ULONG n = 0;
     for (int i = 0; i < USB_MAX_DEVICES; i++) {
+        USB_DEV_INFO *d;
         if (!g_Devs[i].Active) continue;
-        USB_DEV_INFO *d = &out->Devs[n];
+
+        d = &out->Devs[n];
         d->Index = (ULONG)i;
         d->Active = TRUE;
-        d->Vid = g_Devs[i].Vid; d->Pid = g_Devs[i].Pid; d->BcdDevice = g_Devs[i].BcdDevice;
-        d->BusNumber = g_Devs[i].BusNumber; d->DeviceAddress = g_Devs[i].DeviceAddress;
+        d->Vid = g_Devs[i].Vid;
+        d->Pid = g_Devs[i].Pid;
+        d->BcdDevice = g_Devs[i].BcdDevice;
+        d->BusNumber = g_Devs[i].BusNumber;
+        d->DeviceAddress = g_Devs[i].DeviceAddress;
         RtlStringCchCopyW(d->HardwareId, 128, g_Devs[i].HardwareId);
         n++;
     }
     out->Count = n;
     KeReleaseSpinLock(&g_Lock, irql);
+
     *info = sizeof(USB_DEV_LIST);
     return STATUS_SUCCESS;
 }
 
 static NTSTATUS DoCtrl(PVOID buffer, ULONG inLen, PULONG info)
 {
-    if (buffer == NULL || inLen < sizeof(USB_CTRL_REQ)) return STATUS_BUFFER_TOO_SMALL;
-    USB_CTRL_REQ *req = (USB_CTRL_REQ *)buffer;
-    if (req->DevIndex >= USB_MAX_DEVICES || req->wLength > USB_MAX_DATA) return STATUS_INVALID_PARAMETER;
+    USB_CTRL_REQ   *req;
+    PDEVICE_OBJECT  target = NULL;
+    KIRQL           irql;
+    PUCHAR          data;
+    URB             urb;
+    NTSTATUS        st;
 
-    PDEVICE_OBJECT target = NULL;
-    KIRQL irql;
+    if (buffer == NULL || inLen < sizeof(USB_CTRL_REQ)) return STATUS_BUFFER_TOO_SMALL;
+
+    req = (USB_CTRL_REQ *)buffer;
+    if (req->DevIndex >= USB_MAX_DEVICES || req->wLength > USB_MAX_DATA)
+        return STATUS_INVALID_PARAMETER;
+
     KeAcquireSpinLock(&g_Lock, &irql);
     if (g_Devs[req->DevIndex].Active) target = g_Devs[req->DevIndex].DeviceObject;
     KeReleaseSpinLock(&g_Lock, irql);
+
     if (target == NULL) return STATUS_DEVICE_NOT_CONNECTED;
 
-    PUCHAR data = (PUCHAR)buffer + sizeof(USB_CTRL_REQ);
-    URB urb;
+    data = (PUCHAR)buffer + sizeof(USB_CTRL_REQ);
+
     RtlZeroMemory(&urb, sizeof(urb));
-    urb.UrbHeader.Length = sizeof(URB);
+    urb.UrbHeader.Length   = sizeof(URB);
     urb.UrbHeader.Function = URB_FUNCTION_CONTROL_TRANSFER;
     urb.UrbControlTransfer.TransferFlags = (req->bmRequestType & 0x80)
         ? USBD_TRANSFER_DIRECTION_IN : USBD_TRANSFER_DIRECTION_OUT;
@@ -502,53 +527,66 @@ static NTSTATUS DoCtrl(PVOID buffer, ULONG inLen, PULONG info)
     urb.UrbControlTransfer.SetupPacket[6] = (UCHAR)req->wLength;
     urb.UrbControlTransfer.SetupPacket[7] = (UCHAR)(req->wLength >> 8);
 
-    NTSTATUS st = SubmitUrb(target, &urb);
+    st = SubmitUrb(target, &urb);
     if (NT_SUCCESS(st)) {
         req->bytesReturned = urb.UrbControlTransfer.TransferBufferLength;
         *info = sizeof(USB_CTRL_REQ);
-    } else req->bytesReturned = 0;
+    } else {
+        req->bytesReturned = 0;
+    }
     return st;
 }
 
 static NTSTATUS DoBlock(PVOID buffer, ULONG inLen)
 {
+    USB_BLOCK_REQ  *req;
+    PDEVICE_OBJECT  target = NULL;
+    KIRQL           irql;
+
     if (buffer == NULL || inLen < sizeof(USB_BLOCK_REQ)) return STATUS_BUFFER_TOO_SMALL;
-    USB_BLOCK_REQ *req = (USB_BLOCK_REQ *)buffer;
+
+    req = (USB_BLOCK_REQ *)buffer;
     if (req->DevIndex >= USB_MAX_DEVICES) return STATUS_INVALID_PARAMETER;
 
-    PDEVICE_OBJECT target = NULL;
-    KIRQL irql;
     KeAcquireSpinLock(&g_Lock, &irql);
     if (g_Devs[req->DevIndex].Active) {
         target = g_Devs[req->DevIndex].DeviceObject;
         g_Devs[req->DevIndex].Blocked = req->Block;
     }
     KeReleaseSpinLock(&g_Lock, irql);
+
     if (target == NULL) return STATUS_DEVICE_NOT_CONNECTED;
     return BlockDevice(target, req->Block);
 }
 
 static NTSTATUS DoDebug(PVOID buffer, ULONG outLen, PULONG info)
 {
+    USB_DEBUG_INFO *d;
+    KIRQL           irql;
+
     if (buffer == NULL || outLen < sizeof(USB_DEBUG_INFO)) return STATUS_BUFFER_TOO_SMALL;
-    USB_DEBUG_INFO *d = (USB_DEBUG_INFO *)buffer;
-    KIRQL irql;
+
+    d = (USB_DEBUG_INFO *)buffer;
     RtlZeroMemory(d, sizeof(USB_DEBUG_INFO));
+
     KeAcquireSpinLock(&g_Lock, &irql);
-    for (int i = 0; i < USB_MAX_DEVICES; i++) if (g_Devs[i].Active) d->DeviceCount++;
+    for (int i = 0; i < USB_MAX_DEVICES; i++)
+        if (g_Devs[i].Active) d->DeviceCount++;
     KeReleaseSpinLock(&g_Lock, irql);
-    d->HookInstalled  = (g_HubSlotCount > 0) ? 1 : 0;
+
+    d->HookInstalled  = g_HubSlotUsed ? 1 : 0;
     d->HubDriverFound = g_HubFound;
     d->LastScanCount  = g_ScanCount;
     d->LastScanStatus = g_ScanStatus;
     d->HookStatus     = g_HookStatus;
     d->Tracked        = g_Tracked;
+
     *info = sizeof(USB_DEBUG_INFO);
     return STATUS_SUCCESS;
 }
 
 static NTSTATUS UsbAuditDispatch(PVOID buffer, ULONG inLen, ULONG outLen,
-                                ULONG code, PULONG info)
+                                 ULONG code, PULONG info)
 {
     switch (code) {
     case IOCTL_USB_ENUM_DEVICES:     return DoEnum(buffer, outLen, info);
@@ -560,31 +598,25 @@ static NTSTATUS UsbAuditDispatch(PVOID buffer, ULONG inLen, ULONG outLen,
 }
 
 /* ================= 生命周期 ================= */
+
 NTSTATUS UsbAuditInit(VOID)
 {
-    ULONG hooked;
-
     KeInitializeSpinLock(&g_Lock);
     RtlZeroMemory(g_Devs, sizeof(g_Devs));
-    RtlZeroMemory(g_HubSlots, sizeof(g_HubSlots));
-    g_HubSlotCount = 0;
-    g_ScanCount    = 0;
+    RtlZeroMemory(&g_HubSlot, sizeof(g_HubSlot));
+    g_HubSlotUsed = FALSE;
 
-    LOG_INFO("=== USB audit: enumerating all hubs ===");
+    LOG_INFO("=== USB audit: resolving USBHUB3 ===");
 
-    /* 枚举所有 hub 驱动, 走链表, 装 hook */
-    hooked = EnumAllUsbHubs();
+    EnumAllUsbHubs();
 
-    g_HubFound   = hooked;
-    g_HookStatus = (hooked > 0) ? 0 : STATUS_OBJECT_NAME_NOT_FOUND;
-
-    if (hooked == 0) {
-        LOG_ERROR("no USB hub driver found or hooked");
+    if (!g_HubSlotUsed) {
+        LOG_ERROR("=== USB audit init FAILED: no hub hooked ===");
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
 
-    LOG_INFO("=== USB audit ready: %lu hub driver(s) hooked, %lu device(s) scanned ===",
-             hooked, g_ScanCount);
+    LOG_INFO("=== USB audit ready: hub hooked, %lu device(s) scanned, %lu tracked ===",
+             g_ScanCount, g_Tracked);
     return STATUS_SUCCESS;
 }
 
@@ -599,24 +631,24 @@ VOID UsbAuditUnload(VOID)
         KeDelayExecutionThread(KernelMode, FALSE, &d);
     }
 
-    /* 卸载所有 hub 的 hook */
-    for (ULONG i = 0; i < g_HubSlotCount; i++) {
-        HUB_SLOT *slot = &g_HubSlots[i];
-        if (slot->Hook.Active) {
-            HookRemove(&slot->Hook);
-            LOG_INFO("unhooked hub slot %lu", i);
+    if (g_HubSlotUsed) {
+        if (g_HubSlot.Hook.Active) {
+            HookRemove(&g_HubSlot.Hook);
+            LOG_INFO("unhooked USBHUB3");
         }
-        if (slot->Driver != NULL) {
-            ObDereferenceObject(slot->Driver);
-            slot->Driver = NULL;
+        if (g_HubSlot.Driver != NULL) {
+            ObDereferenceObject(g_HubSlot.Driver);
+            g_HubSlot.Driver = NULL;
         }
+        g_HubSlotUsed = FALSE;
     }
-    g_HubSlotCount = 0;
 
-    LOG_INFO("feature unloaded");
+    LOG_INFO("USB audit unloaded");
 }
 
-static const MODULE_DESC g_CoreUsb = {
+/* ================= 模块注册 ================= */
+
+static const MODULE_DESC g_UsbModule = {
     "usb",
     IOCTL_USB_CONTROL_TRANSFER,
     4,
@@ -625,5 +657,5 @@ static const MODULE_DESC g_CoreUsb = {
 
 NTSTATUS UsbAuditRegister(VOID)
 {
-    return ModuleRegister(&g_CoreUsb);
+    return ModuleRegister(&g_UsbModule);
 }
