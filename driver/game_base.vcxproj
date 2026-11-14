@@ -84,21 +84,21 @@
   <ItemGroup>
     <ClCompile Include="driver_main.c" />
     <ClCompile Include="utils\log\game_log.c" />
-    <ClCompile Include="core\core_resolve.c" />
+    <ClCompile Include="core\driver_lookup.c" />
     <ClCompile Include="utils\hook\hook.c" />
     <ClCompile Include="utils\hook\hook_dispatch.c" />
     <ClCompile Include="utils\hook\hook_inline.c" />
-    <ClCompile Include="core\core_device.c" />
-    <ClCompile Include="core\core_usb.c" />
+    <ClCompile Include="core\ioctl.c" />
+    <ClCompile Include="core\usb_audit.c" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="include\fw_user.h" />
+    <ClInclude Include="include\log_types.h" />
     <ClInclude Include="include\game_base.h" />
     <ClInclude Include="utils\log\game_log.h" />
-    <ClInclude Include="include\fw.h" />
-    <ClInclude Include="include\fw_resolve.h" />
+    <ClInclude Include="include\module.h" />
+    <ClInclude Include="include\symbol.h" />
     <ClInclude Include="utils\hook\hook.h" />
-    <ClInclude Include="core\core.h" />
+    <ClInclude Include="core\modules.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

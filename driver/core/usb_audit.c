@@ -7,9 +7,9 @@
  *   3. 提供 ENUM / CTRL(原始 URB) / BLOCK / DEBUG 四个 IOCTL
  *   4. 解析失败时枚举 \Driver 目录, 打印含 HUB 的对象名 (排查用)
  *
- * 后续加新 feature 时, 照这个文件写一个 feat_xxx.c + 一个 FW_FEATURE 即可。
+ * 后续加新 feature 时, 照这个文件写一个 feat_xxx.c + 一个 MODULE_DESC 即可。
  */
-#include "fw.h"
+#include "module.h"
 #include "game_base.h"
 #include <usb.h>
 #include <usbdlib.h>
@@ -62,7 +62,7 @@ static ULONG          g_ScanCount = 0;
 static ULONG          g_ScanStatus = 0xFFFFFFFF;
 
 /* 前向声明 */
-static NTSTATUS CoreUsbDispatch(PVOID buffer, ULONG inLen, ULONG outLen, ULONG code, PULONG info);
+static NTSTATUS UsbAuditDispatch(PVOID buffer, ULONG inLen, ULONG outLen, ULONG code, PULONG info);
 static NTSTATUS MyHubPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 static VOID     EnumExistingDevices(VOID);
 static VOID     DumpDriverDirectory(VOID);
@@ -424,7 +424,7 @@ static NTSTATUS DoDebug(PVOID buffer, ULONG outLen, PULONG info)
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS CoreUsbDispatch(PVOID buffer, ULONG inLen, ULONG outLen,
+static NTSTATUS UsbAuditDispatch(PVOID buffer, ULONG inLen, ULONG outLen,
                                 ULONG code, PULONG info)
 {
     switch (code) {
@@ -437,7 +437,7 @@ static NTSTATUS CoreUsbDispatch(PVOID buffer, ULONG inLen, ULONG outLen,
 }
 
 /* ================= 生命周期 ================= */
-NTSTATUS CoreUsbInit(VOID)
+NTSTATUS UsbAuditInit(VOID)
 {
     PDRIVER_OBJECT hubDrv = NULL;
     NTSTATUS st;
@@ -446,7 +446,7 @@ NTSTATUS CoreUsbInit(VOID)
     RtlZeroMemory(g_Devs, sizeof(g_Devs));
     RtlZeroMemory(&g_PnpHook, sizeof(g_PnpHook));
 
-    st = FwHookResolveDriver(L"\\Driver\\USBHUB3", &hubDrv);
+    st = DriverLookupByName(L"\\Driver\\USBHUB3", &hubDrv);
     g_HookStatus = (ULONG)st;
     if (!NT_SUCCESS(st) || hubDrv == NULL) {
         LOG_ERROR("resolve USBHUB3 failed: %08X", st);
@@ -466,7 +466,7 @@ NTSTATUS CoreUsbInit(VOID)
     return STATUS_SUCCESS;
 }
 
-VOID CoreUsbUnload(VOID)
+VOID UsbAuditUnload(VOID)
 {
     InterlockedExchange(&g_Unloading, 1);
     for (int i = 0; i < 200 && g_InHook != 0; i++) {
@@ -478,14 +478,14 @@ VOID CoreUsbUnload(VOID)
     LOG_INFO("feature unloaded");
 }
 
-static const FW_FEATURE g_CoreUsb = {
+static const MODULE_DESC g_CoreUsb = {
     "usb",
     IOCTL_USB_CONTROL_TRANSFER,
     4,
-    CoreUsbDispatch
+    UsbAuditDispatch
 };
 
-NTSTATUS CoreUsbRegister(VOID)
+NTSTATUS UsbAuditRegister(VOID)
 {
-    return FwFeatureRegister(&g_CoreUsb);
+    return ModuleRegister(&g_CoreUsb);
 }

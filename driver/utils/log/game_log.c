@@ -15,7 +15,7 @@
  * 固定日志前缀
  * ==================================================================
  * 只在这里定义一次。输出形如:
- *   [game_base][2026-11-14 21:30:45.123][WRN][FwHookResolveDriver] resolve failed: C0000024
+ *   [game_base][2026-11-14 21:30:45.123][WRN][DriverLookupByName] resolve failed: C0000024
  *    ^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^  ^^^  ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^
  *    前缀(固定)  本地时间                  级别  函数名              消息
  */
@@ -164,15 +164,20 @@ VOID LogWrite(ULONG level, const char *func, const char *fmt, ...)
         /* 转成可读时间, 避免输出一串原始计数 */
         LogTsToString((ULONGLONG)ts.QuadPart, readable, sizeof(readable));
 
-        /* 输出到调试器。级别决定是否被过滤掉。 */
-        if (level < ARRAYSIZE(g_DpfltrLevel)) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID,
-                       g_DpfltrLevel[level],
-                       "[%s][%s][%s][%s] %s\n",
-                       GAME_LOG_TAG, readable,
-                       LevelName(level), func ? func : "?",
-                       dbg);
-        }
+        /* 输出到调试器。
+         * DbgPrintEx(ComponentId, Level, Format, ...)
+         *   77 = DPFLTR_IHVDRIVER_ID (自定义驱动用这个组件 ID)
+         *   Level: 0=ERROR 1=WARNING 2=TRACE 3=INFO
+         *          数值越小越"重要", 默认 only 会显示 <= 当前 mask 的
+         *
+         * 直接用 0 (ERROR 级别) 保证任何过滤设置下都能看到。
+         * 想看全部就把这里改成 level。 */
+        DbgPrintEx(77,
+                   0,
+                   "[%s][%s][%s][%s] %s\n",
+                   GAME_LOG_TAG, readable,
+                   LevelName(level), func ? func : "?",
+                   dbg);
     }
     va_end(ap);
 #endif

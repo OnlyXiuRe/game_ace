@@ -29,14 +29,14 @@
  * ==================================================================
  * 加新模块的步骤
  * ==================================================================
- *   1. 写 features/feat_xxx.c, 实现一个 FW_FEATURE 结构
+ *   1. 写 features/feat_xxx.c, 实现一个 MODULE_DESC 结构
  *   2. 在 features/feat.h 加 3 个函数声明: Register / Init / Unload
  *   3. 在下面 DriverEntry 里加 Register + Init, DriverUnload 里加 Unload
  *
  *   框架层 (framework/) 不用改。
  */
-#include "fw.h"
-#include "core.h"
+#include "module.h"
+#include "modules.h"
 #include "game_base.h"      /* GAME_BASE_DEVICE_NAME / GAME_BASE_SYMLINK_NAME */
 
 /*
@@ -57,13 +57,13 @@ static VOID DriverUnload(PDRIVER_OBJECT DriverObject)
     LOG_INFO("unloading...");
 
     /* 1. 卸载所有 feature (内部会恢复 hook、等 hook 回调退出) */
-    CoreUsbUnload();
+    UsbAuditUnload();
 
     /* 2. 兜底卸载所有残留 hook (正常情况 feature 已卸完) */
     HookUninit();
 
     /* 3. 删除控制设备 + 符号链接 */
-    FwDeviceUnload();
+    ControlDeviceUnload();
 
     LOG_INFO("unloaded");
 }
@@ -91,8 +91,17 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     UNREFERENCED_PARAMETER(RegistryPath);
 
     /* ---- 1. 日志必须最先初始化, 否则后面的日志会丢失 ---- */
+    /* ===== 调试断点 1: 驱动刚进 DriverEntry =====
+     * 用 KDNET 连上 WinDbg 后 sc start 会在这里断下, 可以:
+     *   r      看寄存器
+     *   kv     看调用栈
+     *   dt nt!_DRIVER_OBJECT @rcx   看 DriverObject
+     *   g      继续 */
     LogInit();
     LOG_INFO("=== game_base anti-cheat driver starting ===");
+
+    /* 记录真实的 IoDriverObjectType（静态链接的符号可能不对） */
+    DriverLookupSetDriverObject(DriverObject);
 
     /* hook 框架初始化 (必须在任何 HookInstall 之前) */
     HookInit();
@@ -103,22 +112,22 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     /* ---- 2. 创建控制设备 ----
      * 设备名和符号链接名来自 include/game_base.h 的 GAME_BASE_*_NAME 常量,
      * 不在这里硬编码字符串。3 环用 GAME_BASE_WIN32_PATH 打开。 */
-    st = FwDeviceInit(DriverObject, GAME_BASE_DEVICE_NAME, GAME_BASE_SYMLINK_NAME);
+    st = ControlDeviceInit(DriverObject, GAME_BASE_DEVICE_NAME, GAME_BASE_SYMLINK_NAME);
     if (!NT_SUCCESS(st)) {
-        LOG_ERROR("FwDeviceInit failed: %08X", st);
+        LOG_ERROR("ControlDeviceInit failed: %08X", st);
         return st;
     }
 
     /* ---- 3. 注册 feature (登记到路由表, 不做事) ---- */
-    st = CoreUsbRegister();
+    st = UsbAuditRegister();
     if (!NT_SUCCESS(st))
-        LOG_ERROR("CoreUsbRegister failed: %08X", st);
+        LOG_ERROR("UsbAuditRegister failed: %08X", st);
 
     /* ---- 4. 初始化 feature (真正干活) ----
      * 失败不返回错误, 保持驱动加载状态, 让 3 环能读日志定位问题 */
-    st = CoreUsbInit();
+    st = UsbAuditInit();
     if (!NT_SUCCESS(st))
-        LOG_ERROR("CoreUsbInit failed: %08X", st);
+        LOG_ERROR("UsbAuditInit failed: %08X", st);
 
     LOG_INFO("=== framework ready (1 feature active) ===");
     return STATUS_SUCCESS;

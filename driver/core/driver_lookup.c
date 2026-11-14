@@ -26,7 +26,7 @@
  *   MmGetSystemRoutineAddress 运行时解析。这与 ACE 的 sub_1400564D0 做法一致。
  */
 #include "hook.h"
-#include "fw.h"
+#include "module.h"
 #include "game_log.h"
 #include <ntstrsafe.h>
 
@@ -47,6 +47,78 @@ typedef NTSTATUS (NTAPI *PFN_ObReferenceObjectByName)(
     PVOID          *Object);
 
 static PFN_ObReferenceObjectByName pObRefByName = NULL;
+
+/* ==================================================================
+ * 真实的 IoDriverObjectType
+ * ==================================================================
+ * 问题: 静态链接的 nt!IoDriverObjectType 符号和这台机器实际内核不匹配,
+ *       用它去调 ObReferenceObjectByName 会返回 C0000024 (类型不匹配)。
+ *
+ * 解决: 从我们自己的 DRIVER_OBJECT 反推真实的 OBJECT_TYPE 指针。
+ *
+ * 原理:
+ *   每个内核对象前面都有一个 OBJECT_HEADER 结构,
+ *   OBJECT_HEADER->Type 就指向该对象的 _OBJECT_TYPE。
+ *
+ *   x64 上 OBJECT_HEADER 的布局:
+ *     offset 0x00: Type         ← OBJECT_TYPE 指针
+ *     offset 0x08: ...
+ *   对象指针 = OBJECT_HEADER + sizeof(OBJECT_HEADER)
+ *
+ *   Windows 提供的宏 OBJECT_TO_OBJECT_HEADER(obj) 可以直接反推,
+ *   但它需要 ntifs.h 里完整的 OBJECT_HEADER 定义。
+ */
+static PVOID g_RealDriverObjectType = NULL;
+
+/*
+ * DriverLookupSetDriverObject - 在 DriverEntry 里调用, 记录真实的驱动对象类型
+ *
+ * 参数:
+ *   driverObject  DriverEntry 收到的参数 (我们的驱动对象)
+ *
+ * 这个函数必须在任何 DriverLookupByName 调用之前执行。
+ */
+VOID DriverLookupSetDriverObject(_In_ PDRIVER_OBJECT driverObject)
+{
+    if (driverObject == NULL) return;
+
+    /* ================================================================
+     * 为什么不能直接用 IoDriverObjectType
+     * ================================================================
+     * 实测发现 (WinDbg):
+     *   静态链接的 nt!IoDriverObjectType 符号 = fffff805`6d373510
+     *   但那个地址的 _OBJECT_HEADER.TypeIndex = 0x65
+     *   ObTypeIndexTable[0x65] = 0   ← 无效类型
+     *
+     *   而我们的 DriverObject 的 TypeIndex = 0x22
+     *   ObTypeIndexTable[0x22] = ffffbe83`0bac7560  ← 真正的 Driver 类型
+     *
+     * 结论: ntoskrnl.lib 里的符号地址和实际内核不匹配。
+     *
+     * 解决: 用微软导出的 ObGetObjectType(对象指针) 直接拿真实类型,
+     *       不用静态符号, 也不用手算 OBJECT_HEADER 偏移。
+     * ================================================================ */
+
+    typedef POBJECT_TYPE (NTAPI *PFN_ObGetObjectType)(PVOID Object);
+
+    UNICODE_STRING  fnName;
+    PFN_ObGetObjectType pfn = NULL;
+
+    RtlInitUnicodeString(&fnName, L"ObGetObjectType");
+    pfn = (PFN_ObGetObjectType)MmGetSystemRoutineAddress(&fnName);
+
+    if (pfn != NULL) {
+        g_RealDriverObjectType = pfn(driverObject);
+
+        LOG_INFO("real Driver OBJECT_TYPE = %p (static link = %p, match=%d)",
+                 g_RealDriverObjectType,
+                 (PVOID)IoDriverObjectType,
+                 (g_RealDriverObjectType == (PVOID)IoDriverObjectType));
+    } else {
+        LOG_ERROR("ObGetObjectType not found, fallback to static IoDriverObjectType");
+        g_RealDriverObjectType = (PVOID)IoDriverObjectType;
+    }
+}
 
 /*
  * ResolveObRef - 解析 ObReferenceObjectByName 并缓存
@@ -75,7 +147,7 @@ static PFN_ObReferenceObjectByName ResolveObRef(VOID)
  * ================================================================== */
 
 /*
- * FwHookResolveDriver - 按名字拿到 DRIVER_OBJECT
+ * DriverLookupByName - 按名字拿到 DRIVER_OBJECT
  *
  * 参数:
  *   drvName  完整路径, 例如 L"\\Driver\\USBHUB3"
@@ -87,7 +159,7 @@ static PFN_ObReferenceObjectByName ResolveObRef(VOID)
  *
  * 注意: 调用方拿到的引用必须在使用完后 ObDereferenceObject 释放。
  */
-NTSTATUS FwHookResolveDriver(const WCHAR *drvName, PDRIVER_OBJECT *out)
+NTSTATUS DriverLookupByName(const WCHAR *drvName, PDRIVER_OBJECT *out)
 {
     UNICODE_STRING name;
     NTSTATUS       st;
@@ -102,11 +174,29 @@ NTSTATUS FwHookResolveDriver(const WCHAR *drvName, PDRIVER_OBJECT *out)
 
         RtlInitUnicodeString(&name, drvName);
 
+        /* ===== 调试断点 2: 即将调 ObReferenceObjectByName =====
+         * 停在这里可以检查:
+         *   p IoDriverObjectType                      看它的值
+         *   dt nt!_OBJECT_TYPE IoDriverObjectType     看 Type/Name/Size
+         *   ?? IoDriverObjectType->Name                期望看到 "Driver"
+         *   p (int)*(char*)IoDriverObjectType          看 Type 字段
+         * 然后:
+         *   p pfn(...)   单步执行这次调用, 看返回值和 obj */
+        /* 优先用运行期反推的真实类型, 失败才退回静态符号 */
+        POBJECT_TYPE objType = (POBJECT_TYPE)(g_RealDriverObjectType
+                                              ? g_RealDriverObjectType
+                                              : (PVOID)IoDriverObjectType);
+
         st = (pfn != NULL)
             ? pfn(&name, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
-                  NULL, 0, IoDriverObjectType, KernelMode, NULL, &obj)
+                  NULL, 0, objType, KernelMode, NULL, &obj)
             : STATUS_PROCEDURE_NOT_FOUND;
 
+        /* ===== 调试断点 3: ObReferenceObjectByName 刚返回 =====
+         * 停在这里可以检查:
+         *   p st        看返回码 (C0000024 = 类型不匹配)
+         *   p obj       看拿到的对象指针 (失败时为 0)
+         *   dt nt!_DRIVER_OBJECT obj   如果非 0 看它是不是驱动对象 */
         if (NT_SUCCESS(st) && obj != NULL) {
             *out = (PDRIVER_OBJECT)obj;
             LOG_INFO("resolved %ws via ObReferenceObjectByName", drvName);
@@ -148,6 +238,6 @@ NTSTATUS FwHookResolveDriver(const WCHAR *drvName, PDRIVER_OBJECT *out)
         LOG_WARN("IoGetDeviceObjectPointer(%ws) -> %08X", devPath, st);
     }
 
-    LOG_ERROR("FwHookResolveDriver: all strategies failed for %ws", drvName);
+    LOG_ERROR("DriverLookupByName: all strategies failed for %ws", drvName);
     return STATUS_OBJECT_NAME_NOT_FOUND;
 }

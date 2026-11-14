@@ -19,7 +19,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
-#include "fw_user.h"
+#include "log_types.h"
 #include "game_base.h"
 #include "../../sha256.h"
 

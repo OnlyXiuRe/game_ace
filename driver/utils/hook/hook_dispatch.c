@@ -60,7 +60,14 @@ NTSTATUS HookDispatchInstall(HOOK_ENTRY *entry, PVOID drvObj,
     if (entry == NULL || drv == NULL || handler == NULL)
         return STATUS_INVALID_PARAMETER;
 
-    if (index >= IRP_MJ_MAXIMUM_FUNCTION) {
+    /* MajorFunction 数组有 IRP_MJ_MAXIMUM_FUNCTION 个元素 (28),
+     * 合法索引 0 ~ 27。IRP_MJ_PNP = 27 是最后一个。
+     * 注意: 不同 WDK 版本里 IRP_MJ_MAXIMUM_FUNCTION 的值可能是 28 或 27,
+     *       所以这里用 > 而不是 >=, 并打印实际值便于排查。 */
+    LOG_INFO("HookDispatchInstall: index=%lu IRP_MJ_MAXIMUM_FUNCTION=%d",
+             index, (int)IRP_MJ_MAXIMUM_FUNCTION);
+
+    if (index > IRP_MJ_MAXIMUM_FUNCTION) {
         LOG_ERROR("HookDispatchInstall: index %lu out of range", index);
         return STATUS_INVALID_PARAMETER;
     }

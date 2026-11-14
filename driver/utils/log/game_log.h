@@ -10,7 +10,7 @@
  *   - Release 版: 宏展开为 do{}while(0), 零开销
  *
  * 日志格式:
- *   [game_base][2026-11-14 21:30:45.123][WRN][FwHookResolveDriver] resolve failed: C0000024
+ *   [game_base][2026-11-14 21:30:45.123][WRN][DriverLookupByName] resolve failed: C0000024
  *    ^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^  ^^^  ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^
  *    固定前缀    本地时间                  级别  函数名              消息
  *
@@ -22,7 +22,7 @@
  */
 #pragma once
 #include <ntddk.h>
-#include "fw_user.h"        /* LOG_ENTRY / LOG_DUMP 定义在这里, UM/KM 共享 */
+#include "log_types.h"        /* LOG_ENTRY / LOG_DUMP 定义在这里, UM/KM 共享 */
 
 /* ==================== 日志级别 ====================
  * 数值越大越详细:

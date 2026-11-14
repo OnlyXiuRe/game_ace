@@ -9,13 +9,13 @@
 #include <ntddk.h>
 
 /* 获取 ntoskrnl 基址 */
-PVOID FwGetKernelBase(VOID);
+PVOID SymbolKernelBase(VOID);
 
 /* 按名称从 ntoskrnl 导出表解析函数地址, 失败返回 NULL */
-PVOID FwResolveExport(_In_ const char *funcName);
+PVOID SymbolResolve(_In_ const char *funcName);
 
 /* 带缓存与日志的解析 (同一名字只查一次) */
-PVOID FwResolveExportCached(_In_ const char *funcName);
+PVOID SymbolResolveCached(_In_ const char *funcName);
 
 /* 清空解析缓存 (卸载时调用) */
-VOID FwResolveReset(VOID);
+VOID SymbolReset(VOID);

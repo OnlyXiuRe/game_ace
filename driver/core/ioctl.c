@@ -5,9 +5,9 @@
  *   IOCTL_FW_LOG_DUMP / IOCTL_FW_LOG_CLEAR  -> 框架自身
  *   其余 IOCTL                              -> 按 IoctlBase 路由到已注册的 feature
  */
-#include "fw.h"
+#include "module.h"
 
-static const FW_FEATURE *g_Features[FW_FEATURE_MAX];
+static const MODULE_DESC *g_Features[MODULE_DESC_MAX];
 static volatile LONG g_FeatureCount = 0;
 static PDEVICE_OBJECT g_DevObj = NULL;
 
@@ -15,13 +15,13 @@ DRIVER_DISPATCH FwDispatchCreateClose;
 DRIVER_DISPATCH FwDispatchDeviceControl;
 static UNICODE_STRING g_SymLinkName;
 
-NTSTATUS FwFeatureRegister(const FW_FEATURE *feat)
+NTSTATUS ModuleRegister(const MODULE_DESC *feat)
 {
     LONG n;
     if (feat == NULL || feat->Dispatch == NULL) return STATUS_INVALID_PARAMETER;
 
     n = InterlockedIncrement(&g_FeatureCount) - 1;
-    if (n >= FW_FEATURE_MAX) {
+    if (n >= MODULE_DESC_MAX) {
         InterlockedDecrement(&g_FeatureCount);
         LOG_ERROR("feature table full");
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -31,11 +31,11 @@ NTSTATUS FwFeatureRegister(const FW_FEATURE *feat)
     return STATUS_SUCCESS;
 }
 
-const FW_FEATURE *FwFeatureFind(ULONG ioctlCode)
+const MODULE_DESC *ModuleFind(ULONG ioctlCode)
 {
     LONG n = g_FeatureCount;
-    for (LONG i = 0; i < n && i < FW_FEATURE_MAX; i++) {
-        const FW_FEATURE *f = g_Features[i];
+    for (LONG i = 0; i < n && i < MODULE_DESC_MAX; i++) {
+        const MODULE_DESC *f = g_Features[i];
         if (f == NULL) continue;
         /* IOCTL 编码: base | (function << 2), 用基址比较 */
         if (ioctlCode >= f->IoctlBase && ioctlCode < f->IoctlBase + (f->IoctlCount << 2))
@@ -78,7 +78,7 @@ NTSTATUS FwDispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         LogClear();
         st = STATUS_SUCCESS;
     } else {
-        const FW_FEATURE *f = FwFeatureFind(code);
+        const MODULE_DESC *f = ModuleFind(code);
         st = (f != NULL) ? f->Dispatch(buffer, inLen, outLen, code, &info)
                          : STATUS_INVALID_DEVICE_REQUEST;
     }
@@ -89,7 +89,40 @@ NTSTATUS FwDispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     return st;
 }
 
-NTSTATUS FwDeviceInit(PDRIVER_OBJECT DriverObject, PCWSTR DeviceName, PCWSTR SymLink)
+/*
+ * RemoveStaleDevice - 尝试删除同名的残留设备对象
+ *
+ * 场景: 上次驱动崩溃/异常卸载时, \Device\game_base 没有被删掉,
+ *       下次 IoCreateDevice 会返回 STATUS_OBJECT_NAME_COLLISION (C0000035)。
+ *
+ * 做法: 用 IoGetDeviceObjectPointer 打开它, 拿到底层 DEVICE_OBJECT 后删除。
+ *       如果设备还被别的驱动引用, 删除会失败, 那就只能重启了。
+ */
+static BOOLEAN RemoveStaleDevice(_In_ PUNICODE_STRING DeviceName)
+{
+    PFILE_OBJECT   fileObj = NULL;
+    PDEVICE_OBJECT devObj  = NULL;
+    NTSTATUS       st;
+
+    /* FILE_READ_ATTRIBUTES 是最小的访问权限 */
+    st = IoGetDeviceObjectPointer(DeviceName, FILE_READ_ATTRIBUTES, &fileObj, &devObj);
+    if (!NT_SUCCESS(st) || devObj == NULL) {
+        LOG_WARN("RemoveStaleDevice: cannot open %wZ -> %08X", DeviceName, st);
+        return FALSE;
+    }
+
+    LOG_INFO("RemoveStaleDevice: found stale device %p, deleting", devObj);
+
+    /* 先释放 FileObject 引用 */
+    if (fileObj != NULL) ObDereferenceObject(fileObj);
+
+    /* 尝试删除设备对象。如果引用计数不为 0 会失败 */
+    IoDeleteDevice(devObj);
+
+    LOG_INFO("RemoveStaleDevice: deleted");
+    return TRUE;
+}
+NTSTATUS ControlDeviceInit(PDRIVER_OBJECT DriverObject, PCWSTR DeviceName, PCWSTR SymLink)
 {
     UNICODE_STRING devName;
     NTSTATUS st;
@@ -119,7 +152,7 @@ NTSTATUS FwDeviceInit(PDRIVER_OBJECT DriverObject, PCWSTR DeviceName, PCWSTR Sym
     return STATUS_SUCCESS;
 }
 
-VOID FwDeviceUnload(VOID)
+VOID ControlDeviceUnload(VOID)
 {
     if (g_SymLinkName.Buffer != NULL) IoDeleteSymbolicLink(&g_SymLinkName);
     if (g_DevObj != NULL) {
