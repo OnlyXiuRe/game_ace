@@ -3,7 +3,7 @@
  *
  * 命名约定:
  *   Gl  = Game Logger        (本模块前缀)
- *   GL_ = 宏/常量前缀        (GL_INFO / GL_LVL_*)
+ *   GL_ = 宏/常量前缀        (LOG_INFO_TAG / LOG_LVL_*)
  *
  * 双通道输出:
  *   通道1 DbgPrintEx   - 按级别过滤, DebugView / WinDbg 可见 (仅 DBG 版)
@@ -15,7 +15,7 @@
 /* ==================== 内部状态 ==================== */
 
 /* 环形缓冲本体: 固定 1024 条, 满了覆盖最旧的 */
-static GL_ENTRY        g_Entries[FW_LOG_MAX];
+static LOG_ENTRY        g_Entries[FW_LOG_MAX];
 
 /* 下一个要写入的下标 (0 ~ FW_LOG_MAX-1, 循环) */
 static volatile LONG   g_Head = 0;
@@ -25,7 +25,7 @@ static volatile LONG   g_Head = 0;
 static volatile LONG   g_Count = 0;
 
 /* 保护 g_Entries / g_Head / g_Count 的自旋锁
- * 驱动可能在多核上并发调用 GlWrite, 必须加锁 */
+ * 驱动可能在多核上并发调用 LogWrite, 必须加锁 */
 static KSPIN_LOCK      g_Lock;
 
 /*
@@ -38,16 +38,16 @@ static KSPIN_LOCK      g_Lock;
  * 比如设为 WARNING 级别, 就看不到 INFO 和 TRACE 的输出。
  */
 static const ULONG g_DpfltrLevel[] = {
-    DPFLTR_INFO_LEVEL,      /* 下标 0 = GL_LVL_INFO  */
-    DPFLTR_WARNING_LEVEL,   /* 下标 1 = GL_LVL_WARN  */
-    DPFLTR_ERROR_LEVEL,     /* 下标 2 = GL_LVL_ERR   */
-    DPFLTR_TRACE_LEVEL      /* 下标 3 = GL_LVL_DEBUG */
+    DPFLTR_INFO_LEVEL,      /* 下标 0 = LOG_LVL_INFO  */
+    DPFLTR_WARNING_LEVEL,   /* 下标 1 = LOG_LVL_WARN  */
+    DPFLTR_ERROR_LEVEL,     /* 下标 2 = LOG_LVL_ERR   */
+    DPFLTR_TRACE_LEVEL      /* 下标 3 = LOG_LVL_DEBUG */
 };
 
 /* ==================== 初始化 / 清理 ==================== */
 
 /* 清空环形缓冲并初始化自旋锁。必须在 DriverEntry 最开头调用。 */
-VOID GlInit(VOID)
+VOID LogInit(VOID)
 {
     KeInitializeSpinLock(&g_Lock);
     RtlZeroMemory(g_Entries, sizeof(g_Entries));
@@ -56,7 +56,7 @@ VOID GlInit(VOID)
 }
 
 /* 运行时清空日志 (对应 IOCTL_FW_LOG_CLEAR), 驱动保持加载状态 */
-VOID GlClear(VOID)
+VOID LogClear(VOID)
 {
     KIRQL irql;
     KeAcquireSpinLock(&g_Lock, &irql);
@@ -72,10 +72,10 @@ VOID GlClear(VOID)
 static const char *LevelName(ULONG level)
 {
     switch (level) {
-    case GL_LVL_INFO:  return "INF";    /* 普通信息   */
-    case GL_LVL_WARN:  return "WRN";    /* 警告       */
-    case GL_LVL_ERR:   return "ERR";    /* 错误       */
-    case GL_LVL_DEBUG: return "DBG";    /* 调试细节   */
+    case LOG_LVL_INFO:  return "INF";    /* 普通信息   */
+    case LOG_LVL_WARN:  return "WRN";    /* 警告       */
+    case LOG_LVL_ERR:   return "ERR";    /* 错误       */
+    case LOG_LVL_DEBUG: return "DBG";    /* 调试细节   */
     default:           return "???";
     }
 }
@@ -83,10 +83,10 @@ static const char *LevelName(ULONG level)
 /* ==================== 核心写入函数 ==================== */
 
 /*
- * GlWrite - 所有日志宏最终都走到这里
+ * LogWrite - 所有日志宏最终都走到这里
  *
  * 参数:
- *   level  日志级别 (GL_LVL_*), 决定 DbgPrintEx 的过滤级别 + 记录里的标记位
+ *   level  日志级别 (LOG_LVL_*), 决定 DbgPrintEx 的过滤级别 + 记录里的标记位
  *   tag    模块标签, 如 "usb" / "hook", 通过 __FUNCTION__ 自动传入
  *   fmt    printf 风格格式串, 如 "device %p failed: %08X"
  *   ...    变参, 对应 fmt 里的占位符
@@ -98,9 +98,9 @@ static const char *LevelName(ULONG level)
  * 注意: 因为要对同一组变参格式化两次, 必须用 va_start/va_end 包裹两次,
  *       C 语言的 va_list 遍历一次后就失效了。
  */
-VOID GlWrite(ULONG level, const char *tag, const char *fmt, ...)
+VOID LogWrite(ULONG level, const char *tag, const char *fmt, ...)
 {
-    GL_ENTRY      e;        /* 待写入的一条记录 */
+    LOG_ENTRY      e;        /* 待写入的一条记录 */
     LARGE_INTEGER ts;       /* 系统时间戳 (100ns 单位) */
     va_list       ap;       /* 变参游标 */
     KIRQL         irql;     /* 加锁前的中断级别, 解锁时恢复 */
@@ -155,7 +155,7 @@ VOID GlWrite(ULONG level, const char *tag, const char *fmt, ...)
 /* ==================== 读取环形缓冲 ==================== */
 
 /*
- * GlDump - 把环形缓冲里的记录按时间顺序拷到 out
+ * LogDump - 把环形缓冲里的记录按时间顺序拷到 out
  *
  * 参数:
  *   out         调用方提供的输出结构 (3 环 IOCTL 的 SystemBuffer)
@@ -167,7 +167,7 @@ VOID GlWrite(ULONG level, const char *tag, const char *fmt, ...)
  *   head 指向下一个写入位置, 所以最旧的记录在 head 的位置
  *   (当缓冲写满一圈后), 拷贝时要从最旧开始, 保证调用方拿到的是时间正序。
  */
-ULONG GlDump(GL_DUMP *out, ULONG maxEntries)
+ULONG LogDump(LOG_DUMP *out, ULONG maxEntries)
 {
     KIRQL irql;
     ULONG n = 0, total, start, i;

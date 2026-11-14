@@ -29,9 +29,9 @@ static PFN_ObReferenceObjectByName ResolveObRef(VOID)
     RtlInitUnicodeString(&n, L"ObReferenceObjectByName");
     pObRefByName = (PFN_ObReferenceObjectByName)MmGetSystemRoutineAddress(&n);
     if (pObRefByName != NULL)
-        FW_INFO("hook", "resolved ObReferenceObjectByName=%p at runtime", pObRefByName);
+        LOG_INFO_TAG("hook", "resolved ObReferenceObjectByName=%p at runtime", pObRefByName);
     else
-        FW_ERR("hook", "MmGetSystemRoutineAddress(ObReferenceObjectByName) failed");
+        LOG_ERROR_TAG("hook", "MmGetSystemRoutineAddress(ObReferenceObjectByName) failed");
     return pObRefByName;
 }
 
@@ -60,21 +60,21 @@ NTSTATUS FwHookResolveDriver(const WCHAR *drvName, PDRIVER_OBJECT *out)
         if (drv->DriverStart != NULL && drv->DriverSize > 0 &&
             drv->MajorFunction[IRP_MJ_CREATE] != NULL) {
             *out = drv;
-            FW_INFO("hook", "resolved %ws (unchecked type, drv=%p, start=%p, size=%lu)",
+            LOG_INFO_TAG("hook", "resolved %ws (unchecked type, drv=%p, start=%p, size=%lu)",
                     drvName, drv, drv->DriverStart, drv->DriverSize);
             return STATUS_SUCCESS;
         }
-        FW_WARN("hook", "object %ws is not a driver (start=%p size=%lu)",
+        LOG_WARN_TAG("hook", "object %ws is not a driver (start=%p size=%lu)",
                 drvName, drv->DriverStart, drv->DriverSize);
         ObDereferenceObject(drv);
         obj = NULL;
     }
     if (NT_SUCCESS(st) && obj != NULL) {
         *out = (PDRIVER_OBJECT)obj;
-        FW_INFO("hook", "resolved %ws via ObReferenceObjectByName", drvName);
+        LOG_INFO_TAG("hook", "resolved %ws via ObReferenceObjectByName", drvName);
         return STATUS_SUCCESS;
     }
-    FW_WARN("hook", "ObReferenceObjectByName(%ws) -> %08X", drvName, st);
+    LOG_WARN_TAG("hook", "ObReferenceObjectByName(%ws) -> %08X", drvName, st);
 
     /* 策略2: \Device\<name> 打开设备再取 DriverObject */
     {
@@ -97,11 +97,11 @@ NTSTATUS FwHookResolveDriver(const WCHAR *drvName, PDRIVER_OBJECT *out)
             *out = dv->DriverObject;
             ObReferenceObject(*out);
             if (fo) ObDereferenceObject(fo);
-            FW_INFO("hook", "resolved %ws via IoGetDeviceObjectPointer", devPath);
+            LOG_INFO_TAG("hook", "resolved %ws via IoGetDeviceObjectPointer", devPath);
             return STATUS_SUCCESS;
         }
         if (fo) ObDereferenceObject(fo);
-        FW_WARN("hook", "IoGetDeviceObjectPointer(%ws) -> %08X", devPath, st);
+        LOG_WARN_TAG("hook", "IoGetDeviceObjectPointer(%ws) -> %08X", devPath, st);
     }
 
     return STATUS_OBJECT_NAME_NOT_FOUND;
@@ -121,10 +121,10 @@ NTSTATUS FwHookInstall(FW_HOOK *hook, PDRIVER_OBJECT drv,
     hook->Active = (hook->Original != NULL);
 
     if (!hook->Active) {
-        FW_ERR("hook", "install failed (index=%lu)", index);
+        LOG_ERROR_TAG("hook", "install failed (index=%lu)", index);
         return STATUS_UNSUCCESSFUL;
     }
-    FW_INFO("hook", "installed MajorFunction[%lu] orig=%p", index, hook->Original);
+    LOG_INFO_TAG("hook", "installed MajorFunction[%lu] orig=%p", index, hook->Original);
     return STATUS_SUCCESS;
 }
 
@@ -135,7 +135,7 @@ VOID FwHookRemove(FW_HOOK *hook)
     InterlockedExchangePointer((PVOID volatile *)&hook->Drv->MajorFunction[hook->Index],
                                (PVOID)hook->Original);
     hook->Active = FALSE;
-    FW_INFO("hook", "removed MajorFunction[%lu]", hook->Index);
+    LOG_INFO_TAG("hook", "removed MajorFunction[%lu]", hook->Index);
 
     if (hook->Drv != NULL) {
         ObDereferenceObject(hook->Drv);

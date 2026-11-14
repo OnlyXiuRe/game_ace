@@ -6,6 +6,32 @@
  */
 #pragma once
 
+/* ==================================================================
+ * 驱动标识常量 —— 只在这里定义一次, 驱动和 3 环都引用这里
+ * ================================================================== */
+
+/* 内核设备名 (NT 对象管理器路径)
+ * 驱动 DriverEntry 里用 IoCreateDevice 创建, 内核态代码用它定位设备 */
+#define GAME_BASE_DEVICE_NAME       L"\\Device\\game_base"
+
+/* 符号链接名 (DosDevices 路径)
+ * 让 3 环能用 Win32 路径打开设备, 对应下面的 GAME_BASE_WIN32_PATH */
+#define GAME_BASE_SYMLINK_NAME      L"\\DosDevices\\game_base"
+
+/* 3 环打开设备用的 Win32 路径 (CreateFileW 的参数)
+ * 注意 C 里 \\ 需要写成 \\\\, 实际字符串是 \\.\game_base */
+#define GAME_BASE_WIN32_PATH        L"\\\\.\\game_base"
+
+/* 服务名 (sc create / sc start / sc stop 用)
+ * 注意服务名是 ANSI 字符串, 不是宽字符 */
+#define GAME_BASE_SERVICE_NAME      "game_base"
+
+/* 驱动文件名 (部署时用) */
+#define GAME_BASE_SYS_FILE          "game_base.sys"
+
+/* ==================================================================
+ * 设备与数据长度上限
+ * ================================================================== */
 #define USB_MAX_DEVICES   64
 #define USB_MAX_PATH      260
 #define USB_MAX_DATA      4096

@@ -154,7 +154,7 @@ static void compute_hash(const char *text, size_t *out_count, char hash_out[65])
 
 /* ================= 驱动交互 ================= */
 static HANDLE open_driver(void) {
-    return CreateFileW(L"\\\\.\\game_base", GENERIC_READ | GENERIC_WRITE,
+    return CreateFileW(GAME_BASE_WIN32_PATH, GENERIC_READ | GENERIC_WRITE,
                        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 }
@@ -339,7 +339,7 @@ int main(int argc, char **argv) {
 
     HANDLE h = open_driver();
     if (h == INVALID_HANDLE_VALUE) {
-        fprintf(stderr, "打不开 \\\\.\\game_base (err=%lu), 驱动是否已加载?\n", GetLastError());
+        fprintf(stderr, "打不开 %ws (err=%lu), 驱动是否已加载?\n", GAME_BASE_WIN32_PATH, GetLastError());
         return 1;
     }
 
@@ -403,7 +403,7 @@ int main(int argc, char **argv) {
             for (ULONG i = 0; i < d.Count; i++) {
                 const char *lv = d.Entries[i].Level == 2 ? "ERR" :
                                  d.Entries[i].Level == 1 ? "WRN" : "INF";
-                printf("[%s][%s] %s\n", lv, d.Entries[i].Module, d.Entries[i].Msg);
+                printf("[%s][%s] %s\n", lv, d.Entries[i].Tag, d.Entries[i].Msg);
             }
         } else {
             printf("LOG ioctl failed (err=%lu)\n", GetLastError());

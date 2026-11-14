@@ -1,5 +1,9 @@
 /*
- * fw.h - 驱动框架核心 (日志 / Hook / 特性注册)
+ * fw.h - 驱动框架核心 (Hook / 特性注册)
+ *
+ * 日志宏统一在 log/game_log.h:
+ *   LOG_INFO(fmt, ...)          - 自动带 __FUNCTION__ 作 tag
+ *   LOG_INFO_TAG(tag, fmt, ...) - 显式指定 tag
  *
  * 设计目标: USB 只是第一个 feature, 后续可加 DMA / IOMMU / 模拟器检测等模块,
  *           每个模块只需实现一个 FW_FEATURE 并注册即可。
@@ -9,14 +13,8 @@
 #include "fw_user.h"
 #include "game_log.h"
 
-/* ==================== 日志 (委托给 log/game_log.h) ==================== */
-/* 统一用 GL_* 宏, 这里保留 FW_* 作为别名以兼容现有模块 */
-#define FW_INFO(tag, fmt, ...)  GL_INFO(tag, fmt, ##__VA_ARGS__)
-#define FW_WARN(tag, fmt, ...)  GL_WARN(tag, fmt, ##__VA_ARGS__)
-#define FW_ERR(tag, fmt, ...)   GL_ERR (tag, fmt, ##__VA_ARGS__)
-#define FW_DBG(tag, fmt, ...)   GL_DBG (tag, fmt, ##__VA_ARGS__)
-
 /* ==================== Hook 模块 ==================== */
+
 typedef struct _FW_HOOK {
     PDRIVER_OBJECT   Drv;           /* 目标驱动对象 */
     ULONG            Index;         /* MajorFunction 索引 */
