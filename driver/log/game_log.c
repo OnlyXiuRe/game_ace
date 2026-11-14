@@ -1,9 +1,9 @@
 /*
  * game_log.c - game_base 内核日志实现
  *
- * 双通道输出:
- *   1. 环形缓冲 (1024 条) - 3 环通过 IOCTL 拉取, 不依赖 WinDbg
- *   2. DbgPrint          - kernel debugger 可见 (仅 debug 版)
+ * 输出:
+ *   DbgPrintEx  - 按级别过滤, DebugView / WinDbg 可见 (仅 debug 版)
+ *   环形缓冲    - 1024 条, 3 环通过 IOCTL 拉取
  */
 #include "game_log.h"
 #include <ntstrsafe.h>
@@ -12,6 +12,18 @@ static GL_ENTRY        g_Entries[FW_LOG_MAX];
 static volatile LONG   g_Head = 0;      /* 下一个写入位置 */
 static volatile LONG   g_Count = 0;     /* 已写入总数 (可超过 FW_LOG_MAX) */
 static KSPIN_LOCK      g_Lock;
+
+/*
+ * DbgPrintEx 过滤级别映射
+ *   数值越小越严重: ERROR(0) < WARNING(1) < TRACE(2) < INFO(3)
+ *   DebugView 里可以按 DPFLTR_* 过滤
+ */
+static const ULONG g_DpfltrLevel[] = {
+    DPFLTR_INFO_LEVEL,      /* GL_LVL_INFO  */
+    DPFLTR_WARNING_LEVEL,   /* GL_LVL_WARN  */
+    DPFLTR_ERROR_LEVEL,     /* GL_LVL_ERR   */
+    DPFLTR_TRACE_LEVEL      /* GL_LVL_DEBUG */
+};
 
 VOID GlInit(VOID)
 {
@@ -51,16 +63,23 @@ VOID GlWrite(ULONG level, const char *tag, const char *fmt, ...)
     LONG idx;
 
 #ifdef DBG
-    /* debug 版同时输出到 kernel debugger */
+    /* ---- 通道1: DbgPrintEx, 按级别过滤 ---- */
     va_start(ap, fmt);
     {
         char dbg[FW_MSG_MAX];
         RtlStringCchVPrintfA(dbg, FW_MSG_MAX, fmt, ap);
-        DbgPrint("[game_base][%s][%s] %s\n", LevelName(level), tag ? tag : "?", dbg);
+
+        if (level < ARRAYSIZE(g_DpfltrLevel)) {
+            DbgPrintEx(DPFLTR_IHVDRIVER_ID,
+                       g_DpfltrLevel[level],
+                       "[game_base][%s][%s] %s\n",
+                       LevelName(level), tag ? tag : "?", dbg);
+        }
     }
     va_end(ap);
 #endif
 
+    /* ---- 通道2: 环形缓冲 (release 版也保留, 供 3 环拉取) ---- */
     RtlZeroMemory(&e, sizeof(e));
     KeQuerySystemTime(&ts);
     e.Ts = (ULONGLONG)ts.QuadPart;
