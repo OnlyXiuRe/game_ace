@@ -312,14 +312,15 @@ static NTSTATUS MyHubPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
  */
 static PDEVICE_OBJECT WalkDeviceStack(PDEVICE_OBJECT top, PULONG depth)
 {
-    PDEVICE_OBJECT cur = top;
-    PDEVICE_OBJECT bottom = NULL;
-    ULONG          d = 0;
+    PDEVICE_OBJECT cur  = top;
+    PDEVICE_OBJECT prev = NULL;
+    ULONG          d    = 0;
 
     if (top == NULL) { *depth = 0; return NULL; }
 
     while (cur != NULL) {
         PDRIVER_OBJECT drv = cur->DriverObject;
+        PDEVICE_OBJECT lower;
 
         if (drv != NULL && drv->DriverName.Buffer != NULL) {
             LOG_INFO("    [stack %lu] dev=%p driver=%wZ", d, cur, &drv->DriverName);
@@ -327,18 +328,35 @@ static PDEVICE_OBJECT WalkDeviceStack(PDEVICE_OBJECT top, PULONG depth)
             LOG_INFO("    [stack %lu] dev=%p driver=<none>", d, cur);
         }
 
-        bottom = cur;
-        cur = IoGetLowerDeviceObject(cur);
+        /* 向下走一层, lower 自带一份引用 */
+        lower = IoGetLowerDeviceObject(cur);
 
-        /* 起始设备不释放, 中间层释放 */
-        if (bottom != top) {
-            ObDereferenceObject(bottom);
+        /*
+         * 释放"上一轮"的中间层。
+         * 起始设备 top 是调用方持有的引用, 绝对不能在这里释放。
+         */
+        if (prev != NULL && prev != top) {
+            ObDereferenceObject(prev);
         }
+
+        prev = cur;
         d++;
+        cur = lower;
     }
 
     *depth = d;
-    return (bottom == top) ? NULL : bottom;
+
+    /*
+     * 循环结束, prev 是最底层:
+     *   - prev == top  说明设备没有下层, 返回 NULL,
+     *                  调用方什么都不用释放 (top 是它的引用)。
+     *   - 否则 prev 还持有一份引用 (最后一次 IoGetLowerDeviceObject
+     *     拿到的), 交给调用方 ObDereferenceObject。
+     *
+     * 注意: 不能像旧实现那样在循环里把 bottom 也 release 掉,
+     *       否则调用方再 release 一次 = 重复释放 = 0x18 蓝屏。
+     */
+    return (prev == top) ? NULL : prev;
 }
 
 /*
@@ -413,6 +431,18 @@ static VOID EnumAllUsbHubs(VOID)
             st = HookInstall(&slot->Hook, HOOK_DISPATCH, drv, MyHubPnp, IRP_MJ_PNP);
 
             if (NT_SUCCESS(st)) {
+                /*
+                 * 引用计数归属（踩过 0x18 REFERENCE_BY_POINTER 的教训）:
+                 *
+                 *   DriverScanFindAll 通过 ObReferenceObjectByName 已经为
+                 *   sd->Driver 持有一份引用, 由 DriverScanRelease 负责释放。
+                 *
+                 *   这里的 slot 需要独立活下去 (卸载时 hook 可能还在飞),
+                 *   所以必须额外 ObReferenceObject 一份, 不能直接共用
+                 *   同一个指针 —— 否则卸载时同一个对象会被 deref 两次,
+                 *   引用计数变负 → 0x18 蓝屏。
+                 */
+                ObReferenceObject(drv);
                 slot->Driver        = drv;
                 slot->DeviceCount   = devCount;
                 slot->MaxStackDepth = maxDepth;
