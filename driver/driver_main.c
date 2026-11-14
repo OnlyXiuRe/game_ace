@@ -59,7 +59,10 @@ static VOID DriverUnload(PDRIVER_OBJECT DriverObject)
     /* 1. 卸载所有 feature (内部会恢复 hook、等 hook 回调退出) */
     FeatUsbUnload();
 
-    /* 2. 删除控制设备 + 符号链接 */
+    /* 2. 兜底卸载所有残留 hook (正常情况 feature 已卸完) */
+    HookUninit();
+
+    /* 3. 删除控制设备 + 符号链接 */
     FwDeviceUnload();
 
     LOG_INFO("unloaded");
@@ -90,6 +93,9 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     /* ---- 1. 日志必须最先初始化, 否则后面的日志会丢失 ---- */
     LogInit();
     LOG_INFO("=== game_base anti-cheat driver starting ===");
+
+    /* hook 框架初始化 (必须在任何 HookInstall 之前) */
+    HookInit();
 
     /* 注册卸载回调, 否则驱动无法 sc stop */
     DriverObject->DriverUnload = DriverUnload;

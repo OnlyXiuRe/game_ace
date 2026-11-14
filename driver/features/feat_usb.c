@@ -52,7 +52,7 @@ typedef struct _TRACKED_DEV {
 
 static KSPIN_LOCK     g_Lock;
 static TRACKED_DEV    g_Devs[USB_MAX_DEVICES];
-static FW_HOOK        g_PnpHook;
+static HOOK_ENTRY      g_PnpHook;
 static volatile LONG  g_Unloading = 0;
 static volatile LONG  g_InHook = 0;
 static ULONG          g_HookStatus = 0xFFFFFFFF;
@@ -178,7 +178,7 @@ static NTSTATUS MyHubPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         else if (minor == IRP_MN_REMOVE_DEVICE) UntrackDevice(DeviceObject);
         InterlockedDecrement(&g_InHook);
     }
-    return g_PnpHook.Original(DeviceObject, Irp);
+    return ((PDRIVER_DISPATCH)g_PnpHook.Original)(DeviceObject, Irp);
 }
 
 /* ================= \Driver 目录枚举 (排查) ================= */
@@ -454,7 +454,7 @@ NTSTATUS FeatUsbInit(VOID)
     }
     g_HubFound = 1;
 
-    st = FwHookInstall(&g_PnpHook, hubDrv, IRP_MJ_PNP, MyHubPnp);
+    st = HookInstall(&g_PnpHook, HOOK_DISPATCH, hubDrv, MyHubPnp, IRP_MJ_PNP);
     if (!NT_SUCCESS(st)) {
         LOG_ERROR("install PnP hook failed: %08X", st);
         ObDereferenceObject(hubDrv);
@@ -474,7 +474,7 @@ VOID FeatUsbUnload(VOID)
         d.QuadPart = -10000;
         KeDelayExecutionThread(KernelMode, FALSE, &d);
     }
-    FwHookRemove(&g_PnpHook);
+    HookRemove(&g_PnpHook);
     LOG_INFO("feature unloaded");
 }
 

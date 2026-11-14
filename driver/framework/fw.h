@@ -1,35 +1,24 @@
 /*
- * fw.h - 驱动框架核心 (Hook / 特性注册)
+ * fw.h - 驱动框架核心
  *
- * 日志宏统一在 log/game_log.h:
- *   LOG_INFO(fmt, ...)          - 自动带 __FUNCTION__ 作 tag
- *   LOG_INFO_TAG(tag, fmt, ...) - 显式指定 tag
+ * 日志: log/game_log.h
+ *   LOG_INFO(fmt, ...)  - 自动带 __FUNCTION__ 作函数名
  *
- * 设计目标: USB 只是第一个 feature, 后续可加 DMA / IOMMU / 模拟器检测等模块,
- *           每个模块只需实现一个 FW_FEATURE 并注册即可。
+ * Hook: framework/hook/hook.h
+ *   HookInstall / HookRemove / HookFindOriginal
+ *
+ * 特性: 每个检测能力实现一个 FW_FEATURE 并注册即可
  */
 #pragma once
 #include <ntddk.h>
 #include "fw_user.h"
 #include "game_log.h"
+#include "hook.h"
 
-/* ==================== Hook 模块 ==================== */
-
-typedef struct _FW_HOOK {
-    PDRIVER_OBJECT   Drv;           /* 目标驱动对象 */
-    ULONG            Index;         /* MajorFunction 索引 */
-    PDRIVER_DISPATCH Original;      /* 原始派发函数 */
-    PDRIVER_DISPATCH Handler;       /* 我们的处理函数 */
-    BOOLEAN          Active;
-} FW_HOOK;
-
-/* 按名称解析驱动对象 (内部尝试多种路径) */
+/* ==================== 驱动对象解析 ====================
+ * 按名字拿到 DRIVER_OBJECT (多策略回退, 定义在 fw_hook.c)
+ */
 NTSTATUS FwHookResolveDriver(_In_ const WCHAR *drvName, _Out_ PDRIVER_OBJECT *out);
-
-/* 安装 / 移除 driver object dispatch hook */
-NTSTATUS FwHookInstall(_Inout_ FW_HOOK *hook, _In_ PDRIVER_OBJECT drv,
-                       _In_ ULONG index, _In_ PDRIVER_DISPATCH handler);
-VOID     FwHookRemove(_Inout_ FW_HOOK *hook);
 
 /* ==================== 特性注册 ==================== */
 #define FW_FEATURE_MAX 8
