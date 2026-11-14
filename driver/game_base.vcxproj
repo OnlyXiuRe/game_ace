@@ -57,7 +57,7 @@
       <Optimization>Disabled</Optimization>
       <SpectreMitigation>false</SpectreMitigation>
       <PreprocessorDefinitions>DBG;_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)framework;$(ProjectDir)framework\hook;$(ProjectDir)features;$(ProjectDir)log;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)utils\log;$(ProjectDir)utils\hook;$(ProjectDir)core;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <DriverSign>
@@ -73,7 +73,7 @@
       <Optimization>MaxSpeed</Optimization>
       <SpectreMitigation>false</SpectreMitigation>
       <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)framework;$(ProjectDir)framework\hook;$(ProjectDir)features;$(ProjectDir)log;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)utils\log;$(ProjectDir)utils\hook;$(ProjectDir)core;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <DriverSign>
@@ -83,22 +83,22 @@
 
   <ItemGroup>
     <ClCompile Include="driver_main.c" />
-    <ClCompile Include="log\game_log.c" />
-    <ClCompile Include="framework\fw_hook.c" />
-    <ClCompile Include="framework\hook\hook.c" />
-    <ClCompile Include="framework\hook\hook_dispatch.c" />
-    <ClCompile Include="framework\hook\hook_inline.c" />
-    <ClCompile Include="framework\fw_device.c" />
-    <ClCompile Include="features\feat_usb.c" />
+    <ClCompile Include="utils\log\game_log.c" />
+    <ClCompile Include="core\core_resolve.c" />
+    <ClCompile Include="utils\hook\hook.c" />
+    <ClCompile Include="utils\hook\hook_dispatch.c" />
+    <ClCompile Include="utils\hook\hook_inline.c" />
+    <ClCompile Include="core\core_device.c" />
+    <ClCompile Include="core\core_usb.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\fw_user.h" />
     <ClInclude Include="include\game_base.h" />
-    <ClInclude Include="log\game_log.h" />
-    <ClInclude Include="framework\fw.h" />
-    <ClInclude Include="framework\fw_resolve.h" />
-    <ClInclude Include="framework\hook\hook.h" />
-    <ClInclude Include="features\feat.h" />
+    <ClInclude Include="utils\log\game_log.h" />
+    <ClInclude Include="include\fw.h" />
+    <ClInclude Include="include\fw_resolve.h" />
+    <ClInclude Include="utils\hook\hook.h" />
+    <ClInclude Include="core\core.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

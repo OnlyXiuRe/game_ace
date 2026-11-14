@@ -36,7 +36,7 @@
  *   框架层 (framework/) 不用改。
  */
 #include "fw.h"
-#include "feat.h"
+#include "core.h"
 #include "game_base.h"      /* GAME_BASE_DEVICE_NAME / GAME_BASE_SYMLINK_NAME */
 
 /*
@@ -57,7 +57,7 @@ static VOID DriverUnload(PDRIVER_OBJECT DriverObject)
     LOG_INFO("unloading...");
 
     /* 1. 卸载所有 feature (内部会恢复 hook、等 hook 回调退出) */
-    FeatUsbUnload();
+    CoreUsbUnload();
 
     /* 2. 兜底卸载所有残留 hook (正常情况 feature 已卸完) */
     HookUninit();
@@ -110,15 +110,15 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     }
 
     /* ---- 3. 注册 feature (登记到路由表, 不做事) ---- */
-    st = FeatUsbRegister();
+    st = CoreUsbRegister();
     if (!NT_SUCCESS(st))
-        LOG_ERROR("FeatUsbRegister failed: %08X", st);
+        LOG_ERROR("CoreUsbRegister failed: %08X", st);
 
     /* ---- 4. 初始化 feature (真正干活) ----
      * 失败不返回错误, 保持驱动加载状态, 让 3 环能读日志定位问题 */
-    st = FeatUsbInit();
+    st = CoreUsbInit();
     if (!NT_SUCCESS(st))
-        LOG_ERROR("FeatUsbInit failed: %08X", st);
+        LOG_ERROR("CoreUsbInit failed: %08X", st);
 
     LOG_INFO("=== framework ready (1 feature active) ===");
     return STATUS_SUCCESS;

@@ -62,7 +62,7 @@ static ULONG          g_ScanCount = 0;
 static ULONG          g_ScanStatus = 0xFFFFFFFF;
 
 /* 前向声明 */
-static NTSTATUS FeatUsbDispatch(PVOID buffer, ULONG inLen, ULONG outLen, ULONG code, PULONG info);
+static NTSTATUS CoreUsbDispatch(PVOID buffer, ULONG inLen, ULONG outLen, ULONG code, PULONG info);
 static NTSTATUS MyHubPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 static VOID     EnumExistingDevices(VOID);
 static VOID     DumpDriverDirectory(VOID);
@@ -424,7 +424,7 @@ static NTSTATUS DoDebug(PVOID buffer, ULONG outLen, PULONG info)
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS FeatUsbDispatch(PVOID buffer, ULONG inLen, ULONG outLen,
+static NTSTATUS CoreUsbDispatch(PVOID buffer, ULONG inLen, ULONG outLen,
                                 ULONG code, PULONG info)
 {
     switch (code) {
@@ -437,7 +437,7 @@ static NTSTATUS FeatUsbDispatch(PVOID buffer, ULONG inLen, ULONG outLen,
 }
 
 /* ================= 生命周期 ================= */
-NTSTATUS FeatUsbInit(VOID)
+NTSTATUS CoreUsbInit(VOID)
 {
     PDRIVER_OBJECT hubDrv = NULL;
     NTSTATUS st;
@@ -466,7 +466,7 @@ NTSTATUS FeatUsbInit(VOID)
     return STATUS_SUCCESS;
 }
 
-VOID FeatUsbUnload(VOID)
+VOID CoreUsbUnload(VOID)
 {
     InterlockedExchange(&g_Unloading, 1);
     for (int i = 0; i < 200 && g_InHook != 0; i++) {
@@ -478,14 +478,14 @@ VOID FeatUsbUnload(VOID)
     LOG_INFO("feature unloaded");
 }
 
-static const FW_FEATURE g_UsbFeature = {
+static const FW_FEATURE g_CoreUsb = {
     "usb",
     IOCTL_USB_CONTROL_TRANSFER,
     4,
-    FeatUsbDispatch
+    CoreUsbDispatch
 };
 
-NTSTATUS FeatUsbRegister(VOID)
+NTSTATUS CoreUsbRegister(VOID)
 {
-    return FwFeatureRegister(&g_UsbFeature);
+    return FwFeatureRegister(&g_CoreUsb);
 }
