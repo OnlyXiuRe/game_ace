@@ -57,7 +57,7 @@ static VOID DriverUnload(PDRIVER_OBJECT DriverObject)
 {
     UNREFERENCED_PARAMETER(DriverObject);
 
-    LOG_INFO_TAG(FW_DRV_NAME, "unloading...");
+    LOG_INFO("unloading...");
 
     /* 1. 卸载所有 feature (内部会恢复 hook、等 hook 回调退出) */
     FeatUsbUnload();
@@ -65,7 +65,7 @@ static VOID DriverUnload(PDRIVER_OBJECT DriverObject)
     /* 2. 删除控制设备 + 符号链接 */
     FwDeviceUnload();
 
-    LOG_INFO_TAG(FW_DRV_NAME, "unloaded");
+    LOG_INFO("unloaded");
 }
 
 /*
@@ -92,7 +92,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 
     /* ---- 1. 日志必须最先初始化, 否则后面的日志会丢失 ---- */
     LogInit();
-    LOG_INFO_TAG(FW_DRV_NAME, "=== game_base anti-cheat driver starting ===");
+    LOG_INFO("=== game_base anti-cheat driver starting ===");
 
     /* 注册卸载回调, 否则驱动无法 sc stop */
     DriverObject->DriverUnload = DriverUnload;
@@ -102,21 +102,21 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
      * 不在这里硬编码字符串。3 环用 GAME_BASE_WIN32_PATH 打开。 */
     st = FwDeviceInit(DriverObject, GAME_BASE_DEVICE_NAME, GAME_BASE_SYMLINK_NAME);
     if (!NT_SUCCESS(st)) {
-        LOG_ERROR_TAG(FW_DRV_NAME, "FwDeviceInit failed: %08X", st);
+        LOG_ERROR("FwDeviceInit failed: %08X", st);
         return st;
     }
 
     /* ---- 3. 注册 feature (登记到路由表, 不做事) ---- */
     st = FeatUsbRegister();
     if (!NT_SUCCESS(st))
-        LOG_ERROR_TAG(FW_DRV_NAME, "FeatUsbRegister failed: %08X", st);
+        LOG_ERROR("FeatUsbRegister failed: %08X", st);
 
     /* ---- 4. 初始化 feature (真正干活) ----
      * 失败不返回错误, 保持驱动加载状态, 让 3 环能读日志定位问题 */
     st = FeatUsbInit();
     if (!NT_SUCCESS(st))
-        LOG_ERROR_TAG(FW_DRV_NAME, "FeatUsbInit failed: %08X", st);
+        LOG_ERROR("FeatUsbInit failed: %08X", st);
 
-    LOG_INFO_TAG(FW_DRV_NAME, "=== framework ready (1 feature active) ===");
+    LOG_INFO("=== framework ready (1 feature active) ===");
     return STATUS_SUCCESS;
 }

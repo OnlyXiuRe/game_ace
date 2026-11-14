@@ -107,12 +107,12 @@ static BOOLEAN QueryDeviceId(PDEVICE_OBJECT devObj, PUSHORT vid, PUSHORT pid,
     NTSTATUS st = IoGetDeviceProperty(devObj, DevicePropertyHardwareID,
                                       sizeof(buf) - sizeof(WCHAR), buf, &len);
     if (!NT_SUCCESS(st) || len < 10) {
-        LOG_WARN_TAG(USB_MOD, "IoGetDeviceProperty dev=%p -> %08X len=%lu", devObj, st, len);
+        LOG_WARN("IoGetDeviceProperty dev=%p -> %08X len=%lu", devObj, st, len);
         return FALSE;
     }
     buf[(sizeof(buf)/sizeof(WCHAR)) - 1] = 0;
     if (!ParseHid(buf, vid, pid, rev)) {
-        LOG_WARN_TAG(USB_MOD, "hardware id parse failed");
+        LOG_WARN("hardware id parse failed");
         return FALSE;
     }
     if (hidOut && hidChars) {
@@ -153,7 +153,7 @@ static VOID TrackDevice(PDEVICE_OBJECT devObj)
         }
     }
     KeReleaseSpinLock(&g_Lock, irql);
-    LOG_INFO_TAG(USB_MOD, "START dev=%p VID=%04X PID=%04X REV=%04X", devObj, vid, pid, rev);
+    LOG_INFO("START dev=%p VID=%04X PID=%04X REV=%04X", devObj, vid, pid, rev);
 }
 
 static VOID UntrackDevice(PDEVICE_OBJECT devObj)
@@ -163,7 +163,7 @@ static VOID UntrackDevice(PDEVICE_OBJECT devObj)
     TRACKED_DEV *d = FindDev(devObj);
     if (d) { d->Active = FALSE; d->DeviceObject = NULL; }
     KeReleaseSpinLock(&g_Lock, irql);
-    LOG_INFO_TAG(USB_MOD, "REMOVE dev=%p", devObj);
+    LOG_INFO("REMOVE dev=%p", devObj);
 }
 
 /* ================= PnP Hook ================= */
@@ -194,7 +194,7 @@ static VOID DumpDriverDirectory(VOID)
 
     st = ZwOpenDirectoryObject(&hDir, DIRECTORY_QUERY, &oa);
     if (!NT_SUCCESS(st)) {
-        LOG_ERROR_TAG(USB_MOD, "ZwOpenDirectoryObject(\\Driver) -> %08X", st);
+        LOG_ERROR("ZwOpenDirectoryObject(\\Driver) -> %08X", st);
         return;
     }
 
@@ -231,12 +231,12 @@ static VOID DumpDriverDirectory(VOID)
             ansi.Length = 0;
             if (NT_SUCCESS(RtlUnicodeStringToAnsiString(&ansi, &info->Name, FALSE))) {
                 tmp[ansi.Length] = 0;
-                LOG_INFO_TAG(USB_MOD, "\\Driver\\%s", tmp);
+                LOG_INFO("\\Driver\\%s", tmp);
             }
         }
     }
 
-    LOG_INFO_TAG(USB_MOD, "\\Driver total=%lu matched(HUB)=%lu", total, hit);
+    LOG_INFO("\\Driver total=%lu matched(HUB)=%lu", total, hit);
     ExFreePool(buf);
     ZwClose(hDir);
 }
@@ -302,7 +302,7 @@ static VOID EnumExistingDevices(VOID)
     NTSTATUS st = IoGetDeviceInterfaces(&GUID_DEVINTERFACE_USB_DEVICE, NULL, 0, &list);
     g_ScanStatus = (ULONG)st;
     if (!NT_SUCCESS(st) || list == NULL) {
-        LOG_WARN_TAG(USB_MOD, "IoGetDeviceInterfaces -> %08X", st);
+        LOG_WARN("IoGetDeviceInterfaces -> %08X", st);
         return;
     }
     int n = 0;
@@ -319,7 +319,7 @@ static VOID EnumExistingDevices(VOID)
     }
     ExFreePool(list);
     g_ScanCount = (ULONG)n;
-    LOG_INFO_TAG(USB_MOD, "scanned %d existing USB interfaces", n);
+    LOG_INFO("scanned %d existing USB interfaces", n);
 }
 
 /* ================= IOCTL ================= */
@@ -449,20 +449,20 @@ NTSTATUS FeatUsbInit(VOID)
     st = FwHookResolveDriver(L"\\Driver\\USBHUB3", &hubDrv);
     g_HookStatus = (ULONG)st;
     if (!NT_SUCCESS(st) || hubDrv == NULL) {
-        LOG_ERROR_TAG(USB_MOD, "resolve USBHUB3 failed: %08X", st);
+        LOG_ERROR("resolve USBHUB3 failed: %08X", st);
         return st;
     }
     g_HubFound = 1;
 
     st = FwHookInstall(&g_PnpHook, hubDrv, IRP_MJ_PNP, MyHubPnp);
     if (!NT_SUCCESS(st)) {
-        LOG_ERROR_TAG(USB_MOD, "install PnP hook failed: %08X", st);
+        LOG_ERROR("install PnP hook failed: %08X", st);
         ObDereferenceObject(hubDrv);
         return st;
     }
 
     EnumExistingDevices();
-    LOG_INFO_TAG(USB_MOD, "feature ready (hook=%d)", g_PnpHook.Active);
+    LOG_INFO("feature ready (hook=%d)", g_PnpHook.Active);
     return STATUS_SUCCESS;
 }
 
@@ -475,7 +475,7 @@ VOID FeatUsbUnload(VOID)
         KeDelayExecutionThread(KernelMode, FALSE, &d);
     }
     FwHookRemove(&g_PnpHook);
-    LOG_INFO_TAG(USB_MOD, "feature unloaded");
+    LOG_INFO("feature unloaded");
 }
 
 static const FW_FEATURE g_UsbFeature = {

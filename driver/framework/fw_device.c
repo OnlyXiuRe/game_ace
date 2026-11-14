@@ -23,11 +23,11 @@ NTSTATUS FwFeatureRegister(const FW_FEATURE *feat)
     n = InterlockedIncrement(&g_FeatureCount) - 1;
     if (n >= FW_FEATURE_MAX) {
         InterlockedDecrement(&g_FeatureCount);
-        LOG_ERROR_TAG("fw", "feature table full");
+        LOG_ERROR("feature table full");
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     g_Features[n] = feat;
-    LOG_INFO_TAG("fw", "feature registered: %s (base=0x%lX)", feat->Name, feat->IoctlBase);
+    LOG_INFO("feature registered: %s (base=0x%lX)", feat->Name, feat->IoctlBase);
     return STATUS_SUCCESS;
 }
 
@@ -98,14 +98,14 @@ NTSTATUS FwDeviceInit(PDRIVER_OBJECT DriverObject, PCWSTR DeviceName, PCWSTR Sym
     st = IoCreateDevice(DriverObject, 0, &devName, FILE_DEVICE_UNKNOWN,
                         FILE_DEVICE_SECURE_OPEN, FALSE, &g_DevObj);
     if (!NT_SUCCESS(st)) {
-        LOG_ERROR_TAG("fw", "IoCreateDevice failed %08X", st);
+        LOG_ERROR("IoCreateDevice failed %08X", st);
         return st;
     }
 
     RtlInitUnicodeString(&g_SymLinkName, SymLink);
     st = IoCreateSymbolicLink(&g_SymLinkName, &devName);
     if (!NT_SUCCESS(st)) {
-        LOG_ERROR_TAG("fw", "IoCreateSymbolicLink failed %08X", st);
+        LOG_ERROR("IoCreateSymbolicLink failed %08X", st);
         IoDeleteDevice(g_DevObj);
         g_DevObj = NULL;
         return st;
@@ -115,7 +115,7 @@ NTSTATUS FwDeviceInit(PDRIVER_OBJECT DriverObject, PCWSTR DeviceName, PCWSTR Sym
     DriverObject->MajorFunction[IRP_MJ_CLOSE]          = FwDispatchCreateClose;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = FwDispatchDeviceControl;
 
-    LOG_INFO_TAG("fw", "control device ready: %ws", SymLink);
+    LOG_INFO("control device ready: %ws", SymLink);
     return STATUS_SUCCESS;
 }
 
@@ -126,5 +126,5 @@ VOID FwDeviceUnload(VOID)
         IoDeleteDevice(g_DevObj);
         g_DevObj = NULL;
     }
-    LOG_INFO_TAG("fw", "control device removed");
+    LOG_INFO("control device removed");
 }
