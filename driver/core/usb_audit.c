@@ -20,6 +20,7 @@
  */
 #include "module.h"
 #include "game_base.h"
+#include "driver_scan.h"
 #include <usb.h>
 #include <usbdlib.h>
 #include <usbioctl.h>
@@ -62,8 +63,12 @@ typedef struct _HUB_SLOT {
     ULONG           MaxStackDepth;      /* 最深设备栈 */
 } HUB_SLOT;
 
-static HUB_SLOT       g_HubSlot;
-static BOOLEAN        g_HubSlotUsed = FALSE;
+/* 最多跟踪的 hub 驱动数 —— 和 driver_scan 保持一致 */
+#define HUB_SLOT_MAX  32
+
+static HUB_SLOT       g_HubSlots[HUB_SLOT_MAX];
+static ULONG          g_HubSlotCount = 0;
+static BOOLEAN        g_HubSlotUsed  = FALSE;   /* 至少有一个成功 */
 
 static volatile LONG  g_Unloading = 0;   /* 卸载标记 */
 static volatile LONG  g_InHook    = 0;   /* 正在 hook 回调里的线程数 */
@@ -220,8 +225,11 @@ static PDRIVER_DISPATCH FindOrigByDevice(PDEVICE_OBJECT DeviceObject)
     if (drv == NULL) return NULL;
 
     KeAcquireSpinLock(&g_Lock, &irql);
-    if (g_HubSlotUsed && g_HubSlot.Driver == drv) {
-        orig = (PDRIVER_DISPATCH)g_HubSlot.Hook.Original;
+    for (ULONG i = 0; i < g_HubSlotCount; i++) {
+        if (g_HubSlots[i].Driver == drv) {
+            orig = (PDRIVER_DISPATCH)g_HubSlots[i].Hook.Original;
+            break;
+        }
     }
     KeReleaseSpinLock(&g_Lock, irql);
 
@@ -309,78 +317,100 @@ static PDEVICE_OBJECT WalkDeviceStack(PDEVICE_OBJECT top, PULONG depth)
 }
 
 /*
- * EnumAllUsbHubs - 按 ACE 的路径枚举所有 hub 并装 hook
+ * EnumAllUsbHubs - 动态发现所有 USB 驱动并装 PnP hook
  *
- * 步骤 (和 ACE 一致):
- *   1. 锚定 \Driver\USBHUB3 → 拿 DRIVER_OBJECT
- *   2. 走 DeviceObject->NextDevice → 所有 hub 设备实例
- *   3. 对每个设备 IoGetLowerDeviceObject → 设备栈
- *   4. 装 IRP_MJ_PNP hook
+ * 不再硬编码驱动名, 走 DriverScanFindAll:
+ *   1. 遍历 \Driver 目录 (128 个驱动对象)
+ *   2. 对每个驱动看 DeviceObject 链的 DeviceType
+ *   3. DeviceType == FILE_DEVICE_USB (0x22) 的就是 USB 驱动
+ *   4. 走设备链记录设备, 装 IRP_MJ_PNP hook
+ *
+ * 这样任何机器、任何厂商的 USB 驱动都能自动发现。
  */
 static VOID EnumAllUsbHubs(VOID)
 {
-    PDRIVER_OBJECT  drv = NULL;
-    NTSTATUS        st;
-    ULONG           devCount = 0;
-    ULONG           maxDepth = 0;
+    ULONG found;
 
-    /* ---- 第 1 步: 锚定 USBHUB3 ---- */
-    st = DriverLookupByName(L"\\Driver\\USBHUB3", &drv);
-    g_HookStatus = (ULONG)st;
+    g_ScanStatus = 0;
+    g_ScanCount  = 0;
+    g_HubSlotCount = 0;
+    g_HubSlotUsed  = FALSE;
 
-    if (!NT_SUCCESS(st) || drv == NULL) {
-        LOG_ERROR("USBHUB3 driver not found: %08X", st);
+    found = DriverScanFindAll(NULL);
+
+    if (found == 0) {
+        LOG_ERROR("EnumAllUsbHubs: no USB driver discovered");
+        g_HookStatus = STATUS_OBJECT_NAME_NOT_FOUND;
         return;
     }
 
-    LOG_INFO("found USBHUB3: DrvObj=%p Start=%p Size=%lu FirstDevice=%p",
-             drv, drv->DriverStart, drv->DriverSize, drv->DeviceObject);
+    /* 对每个发现的 USB 驱动: 走设备链 + 装 hook */
+    for (ULONG i = 0; i < DriverScanCount(); i++) {
+        SCAN_USB_DRIVER *sd = DriverScanGet(i);
+        PDRIVER_OBJECT   drv;
+        ULONG            devCount = 0;
+        ULONG            maxDepth = 0;
+        NTSTATUS         st;
 
-    /* ---- 第 2 步: 走设备链 ---- */
-    for (PDEVICE_OBJECT dev = drv->DeviceObject; dev != NULL; dev = dev->NextDevice) {
-        ULONG          depth  = 0;
-        PDEVICE_OBJECT bottom;
+        if (sd == NULL || sd->Driver == NULL) continue;
+        drv = sd->Driver;
 
-        LOG_INFO("  hub device #%lu: %p", devCount, dev);
+        LOG_INFO("--- driver %wZ (DrvObj=%p) ---", &sd->Name, drv);
+        LOG_INFO("    DriverStart=%p Size=%lu FirstDevice=%p",
+                 drv->DriverStart, drv->DriverSize, drv->DeviceObject);
 
-        /* ---- 第 3 步: 沿设备栈向下 ---- */
-        bottom = WalkDeviceStack(dev, &depth);
-        if (depth > maxDepth) maxDepth = depth;
+        /* 走设备链 */
+        for (PDEVICE_OBJECT dev = drv->DeviceObject; dev != NULL; dev = dev->NextDevice) {
+            ULONG          depth = 0;
+            PDEVICE_OBJECT bottom;
 
-        /* 底层是 PDO, 从它读 HardwareID */
-        if (bottom != NULL) {
-            TrackDevice(bottom);
-            ObDereferenceObject(bottom);
-        } else {
-            TrackDevice(dev);
+            LOG_INFO("    device #%lu: %p (type=0x%lx)",
+                     devCount, dev, dev->DeviceType);
+
+            bottom = WalkDeviceStack(dev, &depth);
+            if (depth > maxDepth) maxDepth = depth;
+
+            if (bottom != NULL) {
+                TrackDevice(bottom);
+                ObDereferenceObject(bottom);
+            }
+
+            devCount++;
         }
 
-        devCount++;
-    }
+        g_ScanCount += devCount;
 
-    g_ScanCount = devCount;
+        /* 装 hook */
+        if (g_HubSlotCount < HUB_SLOT_MAX) {
+            HUB_SLOT *slot = &g_HubSlots[g_HubSlotCount];
 
-    /* ---- 第 4 步: 装 PnP hook ---- */
-    if (!g_HubSlotUsed) {
-        RtlZeroMemory(&g_HubSlot, sizeof(g_HubSlot));
-        st = HookInstall(&g_HubSlot.Hook, HOOK_DISPATCH, drv, MyHubPnp, IRP_MJ_PNP);
+            RtlZeroMemory(slot, sizeof(*slot));
+            st = HookInstall(&slot->Hook, HOOK_DISPATCH, drv, MyHubPnp, IRP_MJ_PNP);
 
-        if (NT_SUCCESS(st)) {
-            g_HubSlot.Driver        = drv;
-            g_HubSlot.DeviceCount   = devCount;
-            g_HubSlot.MaxStackDepth = maxDepth;
-            g_HubSlotUsed           = TRUE;
-            g_HubFound              = 1;
+            if (NT_SUCCESS(st)) {
+                slot->Driver        = drv;
+                slot->DeviceCount   = devCount;
+                slot->MaxStackDepth = maxDepth;
+                sd->Hooked          = TRUE;
+                g_HubSlotCount++;
+                g_HubSlotUsed       = TRUE;
 
-            LOG_INFO("hook USBHUB3 ok: devices=%lu maxStackDepth=%lu orig=%p",
-                     devCount, maxDepth, g_HubSlot.Hook.Original);
+                LOG_INFO("    hook OK: orig=%p handler=%p",
+                         slot->Hook.Original, MyHubPnp);
+            } else {
+                LOG_ERROR("    hook failed: %08X", st);
+            }
         } else {
-            LOG_ERROR("hook USBHUB3 failed: %08X", st);
-            ObDereferenceObject(drv);
+            LOG_WARN("    slot table full, skip %wZ", &sd->Name);
         }
     }
+
+    g_HubFound = g_HubSlotCount;
+    g_HookStatus = g_HubSlotUsed ? 0 : STATUS_UNSUCCESSFUL;
+
+    LOG_INFO("=== %lu driver(s) discovered, %lu hooked, %lu device(s) scanned ===",
+             found, g_HubSlotCount, g_ScanCount);
 }
-
 /* ================= URB / Block ================= */
 
 /*
@@ -574,7 +604,7 @@ static NTSTATUS DoDebug(PVOID buffer, ULONG outLen, PULONG info)
         if (g_Devs[i].Active) d->DeviceCount++;
     KeReleaseSpinLock(&g_Lock, irql);
 
-    d->HookInstalled  = g_HubSlotUsed ? 1 : 0;
+    d->HookInstalled  = g_HubSlotCount;
     d->HubDriverFound = g_HubFound;
     d->LastScanCount  = g_ScanCount;
     d->LastScanStatus = g_ScanStatus;
@@ -603,10 +633,13 @@ NTSTATUS UsbAuditInit(VOID)
 {
     KeInitializeSpinLock(&g_Lock);
     RtlZeroMemory(g_Devs, sizeof(g_Devs));
-    RtlZeroMemory(&g_HubSlot, sizeof(g_HubSlot));
-    g_HubSlotUsed = FALSE;
+    RtlZeroMemory(g_HubSlots, sizeof(g_HubSlots));
+    g_HubSlotCount = 0;
+    g_HubSlotUsed  = FALSE;
 
-    LOG_INFO("=== USB audit: resolving USBHUB3 ===");
+    DriverScanInit();
+
+    LOG_INFO("=== USB audit: discovering USB drivers ===");
 
     EnumAllUsbHubs();
 
@@ -631,17 +664,21 @@ VOID UsbAuditUnload(VOID)
         KeDelayExecutionThread(KernelMode, FALSE, &d);
     }
 
-    if (g_HubSlotUsed) {
-        if (g_HubSlot.Hook.Active) {
-            HookRemove(&g_HubSlot.Hook);
-            LOG_INFO("unhooked USBHUB3");
+    for (ULONG i = 0; i < g_HubSlotCount; i++) {
+        if (g_HubSlots[i].Hook.Active) {
+            HookRemove(&g_HubSlots[i].Hook);
+            LOG_INFO("unhooked slot %lu", i);
         }
-        if (g_HubSlot.Driver != NULL) {
-            ObDereferenceObject(g_HubSlot.Driver);
-            g_HubSlot.Driver = NULL;
+        if (g_HubSlots[i].Driver != NULL) {
+            ObDereferenceObject(g_HubSlots[i].Driver);
+            g_HubSlots[i].Driver = NULL;
         }
-        g_HubSlotUsed = FALSE;
     }
+    g_HubSlotCount = 0;
+    g_HubSlotUsed  = FALSE;
+
+    /* 释放 DriverScan 持有的引用和名字 */
+    DriverScanRelease();
 
     LOG_INFO("USB audit unloaded");
 }

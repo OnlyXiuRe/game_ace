@@ -89,6 +89,7 @@
     <ClCompile Include="utils\hook\hook_dispatch.c" />
     <ClCompile Include="utils\hook\hook_inline.c" />
     <ClCompile Include="core\ioctl.c" />
+    <ClCompile Include="core\driver_scan.c" />
     <ClCompile Include="core\usb_audit.c" />
   </ItemGroup>
   <ItemGroup>
