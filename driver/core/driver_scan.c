@@ -2,49 +2,37 @@
  * driver_scan.c - 动态发现所有 USB 驱动
  *
  * ==================================================================
- * 为什么不用硬编码
+ * 为什么不用 DeviceType 过滤 (踩过的坑)
  * ==================================================================
- *   最初我写了 4 个固定锚点 (USBHUB3 / usbhub / usbccgp / HidUsb),
- *   但不同机器的 USB 驱动集合不一样:
- *     - 有的机器没有 USB 3.0 控制器 → 没有 USBHUB3
- *     - 有的机器装了厂商驱动 → 有额外的 USB 驱动
- *     - 蓝牙 USB、摄像头、打印机都有各自的类驱动
+ *   最初我用 dev->DeviceType == 0x22 判断 USB 设备, 结果几乎所有驱动
+ *   都被误判为 USB 驱动 (PEAUTH / DXGKrnl / SoftwareDevice / 甚至我们
+ *   自己的 game_base)。
  *
- *   所以正确做法是: 遍历 \Driver 目录, 用 DeviceType 过滤。
+ *   原因: WDK 里根本没有 FILE_DEVICE_USB 这个常量!
+ *         FILE_DEVICE_UNKNOWN = 0x00000022
+ *         USBHUB3 的 FDO DeviceType 也是 0x22 (即 UNKNOWN)
  *
- * ==================================================================
- * 原理
- * ==================================================================
- *   1. \Driver 是对象管理器里的一个 Directory 对象
- *      - 用 ZwOpenDirectoryObject 打开
- *      - 用 ZwQueryDirectoryObject 枚举里面的每一项
- *
- *   2. 每一项有 Name 和 TypeName
- *      - TypeName == L"Driver" 的才是驱动对象
- *
- *   3. 对每个驱动对象, 看它的 DeviceObject 链
- *      - DEVICE_OBJECT->DeviceType == FILE_DEVICE_USB (0x22) 就是 USB 驱动
- *      - 实测: usbhub3 的 FDO DeviceType = 0x22
- *
- *   4. 找到 USB 驱动后, 装 IRP_MJ_PNP hook
+ *   所以 DeviceType 完全是 "未分类" 的默认值, 无法区分 USB。
  *
  * ==================================================================
- * 验证数据 (WinDbg 实测)
+ * 实际可用的过滤条件
  * ==================================================================
- *   \Driver 目录: 128 个驱动对象
- *   其中 USB 相关:
- *     usbuhci    USB 1.1 UHCI 控制器
- *     usbehci    USB 2.0 EHCI 控制器
- *     USBXHCI    USB 3.0 xHCI 控制器
- *     Ucx01000   USB 控制器扩展
- *     usbhub     USB 1.1/2.0 Hub
- *     USBHUB3    USB 3.0 Hub
- *     usbccgp    USB 复合设备父驱动
- *     HidUsb     HID USB 类驱动
- *     BTHUSB     蓝牙 USB
- *     BthEnum    蓝牙枚举
+ *   条件 A: 驱动名包含 "usb" (不区分大小写)
+ *     usbuhci / usbehci / USBXHCI / usbhub / USBHUB3 / usbccgp
+ *     HidUsb / BTHUSB / vmusbmouse / ucxcx0000...
  *
- *   usbhub3 FDO: DeviceType = 0x22 (FILE_DEVICE_USB) ✓
+ *   条件 B: 设备的底层栈里有名字含 "usb" 的驱动
+ *     覆盖 Ucx01000 (USB 控制器扩展, 名字里没有 usb,
+ *     但它的下层设备挂在 USBXHCI 上)
+ *
+ *   两个条件任一满足即认为是 USB 驱动。
+ *
+ * ==================================================================
+ * 目录枚举的正确姿势
+ * ==================================================================
+ *   ZwQueryDirectoryObject 必须用 ReturnSingleEntry = TRUE!
+ *   传 FALSE 时内核把所有条目打包进缓冲区, 只能解析第一个结构,
+ *   后面的需要自己按 UNICODE_STRING 长度推算, 极易出错。
  */
 #include "module.h"
 #include "game_base.h"
@@ -52,8 +40,17 @@
 #include <ntstrsafe.h>
 
 #define SCAN_MOD "scan"
-/* ================= WDK 未声明的对象目录 API ================= */
 
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#endif
+
+/* 目录枚举的缓冲区大小 */
+#define SCAN_DIR_BUFFER  4096
+
+/* ================= WDK 未声明的内核 API ================= */
+
+/* 对象目录条目（ZwQueryDirectoryObject 的输出结构） */
 typedef struct _OBJECT_DIRECTORY_INFORMATION {
     UNICODE_STRING Name;
     UNICODE_STRING TypeName;
@@ -73,44 +70,106 @@ NTSYSAPI NTSTATUS NTAPI ZwQueryDirectoryObject(
     _Inout_ PULONG Context,
     _Out_opt_ PULONG ReturnLength);
 
-#ifndef ARRAY_SIZE
-#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
-#endif
-
-/* DeviceType: 0x22 = FILE_DEVICE_USB */
-#ifndef FILE_DEVICE_USB
-#define FILE_DEVICE_USB 0x22
-#endif
-
-/* 目录枚举的缓冲区大小 */
-#define SCAN_DIR_BUFFER  8192
+/* ntifs.h 有声明, ntddk.h 没有 */
+extern PDEVICE_OBJECT IoGetLowerDeviceObject(_In_ PDEVICE_OBJECT DeviceObject);
 
 /* 最多跟踪的 USB 驱动数 */
-#define SCAN_MAX_DRIVERS 32
+#define SCAN_MAX_DRIVERS 64
 
 /* ================= 状态 ================= */
 
-/* SCAN_USB_DRIVER 结构在 driver_scan.h 里定义, 这里直接用 */
-
 static SCAN_USB_DRIVER  g_UsbDrivers[SCAN_MAX_DRIVERS];
 static ULONG            g_UsbDriverCount = 0;
-static KSPIN_LOCK       g_ScanLock;
 
-/* ================= 内部 ================= */
+/* ================= 工具 ================= */
 
 /*
- * IsUsbDriver - 判断一个驱动对象是否管理 USB 设备
+ * ContainsNoCase - 不区分大小写的子串查找
  *
- * 遍历它的设备链, 只要有任一设备的 DeviceType == FILE_DEVICE_USB 就算。
+ * 为什么不用 wcsstr: wcsstr 区分大小写, 而 \Driver\HidUsb 里是混合大小写,
+ * 我们需要同时匹配 "usb" / "Usb" / "USB"。
  */
-static BOOLEAN IsUsbDriver(PDRIVER_OBJECT drv)
+static BOOLEAN ContainsNoCase(_In_ PCWSTR haystack, _In_ PCWSTR needle)
+{
+    if (haystack == NULL || needle == NULL) return FALSE;
+
+    size_t hlen, nlen, i, j;
+
+    for (hlen = 0; haystack[hlen]; hlen++) {}
+    for (nlen = 0; needle[nlen]; nlen++)   {}
+    if (nlen == 0 || hlen < nlen) return FALSE;
+
+    for (i = 0; i + nlen <= hlen; i++) {
+        BOOLEAN match = TRUE;
+        for (j = 0; j < nlen; j++) {
+            WCHAR a = haystack[i + j];
+            WCHAR b = needle[j];
+            if (a >= L'A' && a <= L'Z') a += L'a' - L'A';
+            if (b >= L'A' && b <= L'Z') b += L'a' - L'A';
+            if (a != b) { match = FALSE; break; }
+        }
+        if (match) return TRUE;
+    }
+    return FALSE;
+}
+
+/*
+ * DriverNameHasUsb - 驱动名是否包含 "usb"
+ */
+static BOOLEAN DriverNameHasUsb(_In_ PDRIVER_OBJECT drv)
+{
+    if (drv == NULL) return FALSE;
+    if (drv->DriverName.Buffer == NULL) return FALSE;
+
+    /* DriverName 是 UNICODE_STRING, Buffer 可能不是以 0 结尾,
+     * 但内核里驱动对象的名字都带结束符, 这里可以直接当 C 串用 */
+    return ContainsNoCase(drv->DriverName.Buffer, L"usb");
+}
+
+/*
+ * StackHasUsbDriver - 设备的底层栈里有没有名字含 usb 的驱动
+ *
+ * 用于覆盖 Ucx01000 这种名字不含 usb、但底层接着 USB 控制器的驱动。
+ */
+static BOOLEAN StackHasUsbDriver(_In_ PDEVICE_OBJECT top)
+{
+    PDEVICE_OBJECT cur  = top;
+    PDEVICE_OBJECT next = NULL;
+    BOOLEAN        hit  = FALSE;
+
+    while (cur != NULL && !hit) {
+        if (DriverNameHasUsb(cur->DriverObject)) hit = TRUE;
+
+        next = IoGetLowerDeviceObject(cur);
+        if (cur != top) ObDereferenceObject(cur);
+        cur = next;
+        if (hit && cur != NULL) {
+            /* 命中了, 但 next 有引用需要释放 */
+            ObDereferenceObject(cur);
+            cur = NULL;
+            break;
+        }
+    }
+
+    /* 收尾: 如果循环因为 cur == NULL 结束, 没有额外引用需要释放 */
+    return hit;
+}
+
+/*
+ * IsUsbDriver - 判断一个驱动对象是否属于 USB 栈
+ *
+ * 策略: 驱动名含 "usb" 或 任一设备的底层栈含 "usb" 驱动
+ */
+static BOOLEAN IsUsbDriver(_In_ PDRIVER_OBJECT drv)
 {
     if (drv == NULL) return FALSE;
 
+    /* 条件 A: 驱动名自带 usb */
+    if (DriverNameHasUsb(drv)) return TRUE;
+
+    /* 条件 B: 设备栈里有 usb 驱动 */
     for (PDEVICE_OBJECT dev = drv->DeviceObject; dev != NULL; dev = dev->NextDevice) {
-        if (dev->DeviceType == FILE_DEVICE_USB) {
-            return TRUE;
-        }
+        if (StackHasUsbDriver(dev)) return TRUE;
     }
     return FALSE;
 }
@@ -118,7 +177,7 @@ static BOOLEAN IsUsbDriver(PDRIVER_OBJECT drv)
 /*
  * CountDevices - 统计驱动的设备数
  */
-static ULONG CountDevices(PDRIVER_OBJECT drv)
+static ULONG CountDevices(_In_ PDRIVER_OBJECT drv)
 {
     ULONG n = 0;
     for (PDEVICE_OBJECT dev = drv->DeviceObject; dev != NULL; dev = dev->NextDevice) n++;
@@ -126,7 +185,7 @@ static ULONG CountDevices(PDRIVER_OBJECT drv)
 }
 
 /*
- * ReleaseAll - 释放所有已记录的驱动引用
+ * ReleaseAll - 释放所有已记录的驱动引用和名字内存
  */
 static VOID ReleaseAll(VOID)
 {
@@ -137,7 +196,9 @@ static VOID ReleaseAll(VOID)
         }
         if (g_UsbDrivers[i].Name.Buffer != NULL) {
             ExFreePool(g_UsbDrivers[i].Name.Buffer);
-            g_UsbDrivers[i].Name.Buffer = NULL;
+            g_UsbDrivers[i].Name.Buffer    = NULL;
+            g_UsbDrivers[i].Name.Length    = 0;
+            g_UsbDrivers[i].Name.MaximumLength = 0;
         }
     }
     g_UsbDriverCount = 0;
@@ -145,12 +206,8 @@ static VOID ReleaseAll(VOID)
 
 /* ================= 对外接口 ================= */
 
-/*
- * DriverScanInit - 初始化扫描模块
- */
 VOID DriverScanInit(VOID)
 {
-    KeInitializeSpinLock(&g_ScanLock);
     RtlZeroMemory(g_UsbDrivers, sizeof(g_UsbDrivers));
     g_UsbDriverCount = 0;
 }
@@ -159,8 +216,6 @@ VOID DriverScanInit(VOID)
  * DriverScanFindAll - 遍历 \Driver 目录, 找出所有 USB 驱动
  *
  * 返回: 找到的 USB 驱动数量
- *
- * 副作用: 每个找到的驱动都持有 ObReference, 调用 DriverScanRelease 释放
  */
 ULONG DriverScanFindAll(PVOID hookContext)
 {
@@ -173,6 +228,9 @@ ULONG DriverScanFindAll(PVOID hookContext)
     ULONG              len = 0;
     BOOLEAN            first = TRUE;
     ULONG              found = 0;
+    ULONG              totalEntries = 0;
+
+    UNREFERENCED_PARAMETER(hookContext);
 
     RtlInitUnicodeString(&dirName, L"\\Driver");
     InitializeObjectAttributes(&oa, &dirName,
@@ -200,56 +258,63 @@ ULONG DriverScanFindAll(PVOID hookContext)
 
         RtlZeroMemory(buf, SCAN_DIR_BUFFER);
 
+        /* 关键: ReturnSingleEntry = TRUE, 一次取一个条目 */
         st = ZwQueryDirectoryObject(hDir, buf, SCAN_DIR_BUFFER,
-                                   FALSE,        /* ReturnSingleEntry */
+                                   TRUE,         /* ReturnSingleEntry */
                                    first,        /* RestartScan */
                                    &ctx, &len);
         first = FALSE;
 
-        if (!NT_SUCCESS(st) || st == STATUS_NO_MORE_ENTRIES) break;
+        if (st == STATUS_NO_MORE_ENTRIES) break;
+        if (!NT_SUCCESS(st)) {
+            LOG_WARN("ZwQueryDirectoryObject -> %08X at entry %lu", st, totalEntries);
+            break;
+        }
 
         info = (POBJECT_DIRECTORY_INFORMATION)buf;
+        totalEntries++;
 
-        /* 只要 Driver 类型 */
         if (info->TypeName.Buffer == NULL) continue;
         if (_wcsicmp(info->TypeName.Buffer, L"Driver") != 0) continue;
 
-        /* 拼完整路径 \Driver\XXX */
         RtlStringCchPrintfW(fullName, 256, L"\\Driver\\%wZ", &info->Name);
 
-        /* 解析驱动对象 */
         if (!NT_SUCCESS(DriverLookupByName(fullName, &drv)) || drv == NULL) {
             continue;
         }
 
-        /* 判断是否 USB 驱动 */
-        if (IsUsbDriver(drv)) {
-            ULONG devCount = CountDevices(drv);
+        if (!IsUsbDriver(drv)) {
+            ObDereferenceObject(drv);
+            continue;
+        }
+
+        /* 是 USB 驱动 */
+        if (g_UsbDriverCount < SCAN_MAX_DRIVERS) {
+            SCAN_USB_DRIVER *slot = &g_UsbDrivers[g_UsbDriverCount];
+            USHORT nameBytes = info->Name.Length;
+
+            RtlZeroMemory(slot, sizeof(*slot));
+            slot->Driver      = drv;          /* 保留引用 */
+            slot->DeviceCount = CountDevices(drv);
+            slot->Hooked      = FALSE;
+
+            /* 拷贝驱动名 */
+            slot->Name.MaximumLength = (USHORT)(nameBytes + sizeof(WCHAR));
+            slot->Name.Buffer = (PWCHAR)ExAllocatePoolWithTag(
+                NonPagedPool, slot->Name.MaximumLength, 'nSnD');
+            if (slot->Name.Buffer != NULL) {
+                slot->Name.Length = nameBytes;
+                RtlCopyMemory(slot->Name.Buffer, info->Name.Buffer, nameBytes);
+                slot->Name.Buffer[nameBytes / sizeof(WCHAR)] = 0;
+            }
+
+            g_UsbDriverCount++;
+            found++;
 
             LOG_INFO("  USB driver: %wZ (DrvObj=%p devices=%lu)",
-                     &info->Name, drv, devCount);
-
-            if (g_UsbDriverCount < SCAN_MAX_DRIVERS) {
-                SCAN_USB_DRIVER *slot = &g_UsbDrivers[g_UsbDriverCount];
-
-                RtlZeroMemory(slot, sizeof(*slot));
-                slot->Driver      = drv;          /* 保留引用 */
-                slot->DeviceCount = devCount;
-                slot->Name.MaximumLength = info->Name.Length + sizeof(WCHAR);
-                slot->Name.Buffer = (PWCHAR)ExAllocatePoolWithTag(
-                    NonPagedPool, slot->Name.MaximumLength, 'nSnD');
-                if (slot->Name.Buffer != NULL) {
-                    RtlCopyUnicodeString(&slot->Name, &info->Name);
-                }
-
-                g_UsbDriverCount++;
-                found++;
-            } else {
-                LOG_WARN("  USB driver table full, skip %wZ", &info->Name);
-                ObDereferenceObject(drv);
-            }
+                     &slot->Name, drv, slot->DeviceCount);
         } else {
-            /* 不是 USB 驱动, 释放引用 */
+            LOG_WARN("  table full (%lu), skip %wZ", SCAN_MAX_DRIVERS, &info->Name);
             ObDereferenceObject(drv);
         }
     }
@@ -257,13 +322,11 @@ ULONG DriverScanFindAll(PVOID hookContext)
     ExFreePoolWithTag(buf, 'cSnD');
     ZwClose(hDir);
 
-    LOG_INFO("=== scan done: %lu USB driver(s) found ===", found);
+    LOG_INFO("=== scan done: %lu entries scanned, %lu USB driver(s) found ===",
+             totalEntries, found);
     return found;
 }
 
-/*
- * DriverScanGet - 取第 i 个找到的 USB 驱动
- */
 SCAN_USB_DRIVER *DriverScanGet(ULONG index)
 {
     if (index >= g_UsbDriverCount) return NULL;
@@ -275,9 +338,6 @@ ULONG DriverScanCount(VOID)
     return g_UsbDriverCount;
 }
 
-/*
- * DriverScanRelease - 释放所有引用
- */
 VOID DriverScanRelease(VOID)
 {
     ReleaseAll();
