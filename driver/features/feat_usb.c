@@ -10,7 +10,7 @@
  * 后续加新 feature 时, 照这个文件写一个 feat_xxx.c + 一个 FW_FEATURE 即可。
  */
 #include "fw.h"
-#include "usb_filter.h"
+#include "game_base.h"
 #include <usb.h>
 #include <usbdlib.h>
 #include <usbioctl.h>

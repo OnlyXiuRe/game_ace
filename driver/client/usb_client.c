@@ -1,7 +1,7 @@
 /*
- * usb_client.c - 3 环客户端: 通过 \\.\usb_filter 枚举设备 / 发探针 / 封锁
+ * usb_client.c - 3 环客户端: 通过 \\.\game_base 枚举设备 / 发探针 / 封锁
  *
- * 驱动侧 (usb_filter.sys) hook 了 usbhub3.sys 的 IRP_MJ_PNP,
+ * 驱动侧 (game_base.sys) hook 了 usbhub3.sys 的 IRP_MJ_PNP,
  * 在设备 START/REMOVE 时记录设备, 并通过控制设备暴露给这里。
  *
  * 用法:
@@ -20,8 +20,8 @@
 #include <stdint.h>
 #include <time.h>
 #include "fw_user.h"
-#include "usb_filter.h"
-#include "../sha256.h"
+#include "game_base.h"
+#include "../../sha256.h"
 
 #define DEFAULT_PROBES 512
 
@@ -154,7 +154,7 @@ static void compute_hash(const char *text, size_t *out_count, char hash_out[65])
 
 /* ================= 驱动交互 ================= */
 static HANDLE open_driver(void) {
-    return CreateFileW(L"\\\\.\\usb_filter", GENERIC_READ | GENERIC_WRITE,
+    return CreateFileW(L"\\\\.\\game_base", GENERIC_READ | GENERIC_WRITE,
                        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 }
@@ -339,7 +339,7 @@ int main(int argc, char **argv) {
 
     HANDLE h = open_driver();
     if (h == INVALID_HANDLE_VALUE) {
-        fprintf(stderr, "打不开 \\\\.\\usb_filter (err=%lu), 驱动是否已加载?\n", GetLastError());
+        fprintf(stderr, "打不开 \\\\.\\game_base (err=%lu), 驱动是否已加载?\n", GetLastError());
         return 1;
     }
 

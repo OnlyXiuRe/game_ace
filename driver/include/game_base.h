@@ -1,6 +1,7 @@
-/* usb_filter.h - 驱动与用户态共享定义 (v3: usbhub3 hook + 设备枚举/探测/封锁)
+/* game_base.h - game_base.sys 与用户态共享定义
+ * 反作弊驱动框架: 框架 IOCTL + 各 feature 的 IOCTL/结构
  * 包含方:
- *   - 驱动: #include <ntddk.h> + <wdf.h> 之后
+ *   - 驱动: #include <ntddk.h> 之后
  *   - 客户端: #include <windows.h> + <initguid.h> 之后
  */
 #pragma once
