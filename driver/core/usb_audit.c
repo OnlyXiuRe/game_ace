@@ -57,10 +57,11 @@ static TRACKED_DEV    g_Devs[USB_MAX_DEVICES];
  * HUB_SLOT - 一个 hub 驱动的 hook 槽
  */
 typedef struct _HUB_SLOT {
-    HOOK_ENTRY      Hook;               /* hook 框架的条目 */
-    PDRIVER_OBJECT  Driver;             /* hub 的驱动对象 (带引用) */
-    ULONG           DeviceCount;        /* 该驱动的设备数 */
-    ULONG           MaxStackDepth;      /* 最深设备栈 */
+    HOOK_ENTRY       Hook;               /* hook 框架的条目 */
+    PDRIVER_OBJECT   Driver;             /* hub 的驱动对象 (带引用) */
+    PDRIVER_DISPATCH OriginalDispatch;   /* 原 IRP_MJ_PNP 函数 (自己保存副本) */
+    ULONG            DeviceCount;        /* 该驱动的设备数 */
+    ULONG            MaxStackDepth;      /* 最深设备栈 */
 } HUB_SLOT;
 
 /* 最多跟踪的 hub 驱动数 —— 和 driver_scan 保持一致 */
@@ -227,7 +228,14 @@ static PDRIVER_DISPATCH FindOrigByDevice(PDEVICE_OBJECT DeviceObject)
     KeAcquireSpinLock(&g_Lock, &irql);
     for (ULONG i = 0; i < g_HubSlotCount; i++) {
         if (g_HubSlots[i].Driver == drv) {
-            orig = (PDRIVER_DISPATCH)g_HubSlots[i].Hook.Original;
+            /*
+             * 用自己的 OriginalDispatch 副本, 而不是 Hook.Original。
+             * 原因: HookInstall 内部会在某个时刻回填 Hook.Original,
+             *       如果 hook 已经生效但 Original 还没回填, 这里就会
+             *       拿到 NULL, 进而把 PnP IRP 用错误状态完成 → 0xCA。
+             *       OriginalDispatch 在登记 slot 时就已写好, 永远可用。
+             */
+            orig = g_HubSlots[i].OriginalDispatch;
             break;
         }
     }
@@ -425,34 +433,52 @@ static VOID EnumAllUsbHubs(VOID)
 
         /* 装 hook */
         if (g_HubSlotCount < HUB_SLOT_MAX) {
-            HUB_SLOT *slot = &g_HubSlots[g_HubSlotCount];
+            HUB_SLOT         *slot = &g_HubSlots[g_HubSlotCount];
+            PDRIVER_DISPATCH  orig;
 
             RtlZeroMemory(slot, sizeof(*slot));
+
+            /*
+             * ============================================================
+             * 顺序至关重要 —— 这里踩过 0xCA PNP_DETECTED_FATAL_ERROR
+             * ============================================================
+             * HookInstall 一旦返回, MajorFunction[27] 就指向 MyHubPnp。
+             * 如果那时 slot 还没登记 (g_HubSlotCount 没加),
+             * FindOrigByDevice 就查不到它, MyHubPnp 拿到 orig == NULL,
+             * 于是用 STATUS_DEVICE_NOT_READY 把 PnP IRP 完成掉 ——
+             * 设备的 PnP 状态机被打乱, 立刻 0xCA 蓝屏。
+             *
+             * 扫描 126 个驱动要几十毫秒, 这个窗口足够 PnP 管理器塞进
+             * 一批 IRP, 所以必现。
+             *
+             * 正确顺序:
+             *   1. 先读原派发函数
+             *   2. 填好 slot 并 ObReferenceObject
+             *   3. g_HubSlotCount++ (从此 FindOrigByDevice 能找到它)
+             *   4. 最后才 HookInstall (此时才真正生效)
+             * ============================================================
+             */
+            orig = (PDRIVER_DISPATCH)drv->MajorFunction[IRP_MJ_PNP];
+
+            ObReferenceObject(drv);
+            slot->Driver           = drv;
+            slot->OriginalDispatch = orig;
+            slot->DeviceCount      = devCount;
+            slot->MaxStackDepth    = maxDepth;
+            g_HubSlotCount++;                 /* 先登记 */
+
             st = HookInstall(&slot->Hook, HOOK_DISPATCH, drv, MyHubPnp, IRP_MJ_PNP);
 
             if (NT_SUCCESS(st)) {
-                /*
-                 * 引用计数归属（踩过 0x18 REFERENCE_BY_POINTER 的教训）:
-                 *
-                 *   DriverScanFindAll 通过 ObReferenceObjectByName 已经为
-                 *   sd->Driver 持有一份引用, 由 DriverScanRelease 负责释放。
-                 *
-                 *   这里的 slot 需要独立活下去 (卸载时 hook 可能还在飞),
-                 *   所以必须额外 ObReferenceObject 一份, 不能直接共用
-                 *   同一个指针 —— 否则卸载时同一个对象会被 deref 两次,
-                 *   引用计数变负 → 0x18 蓝屏。
-                 */
-                ObReferenceObject(drv);
-                slot->Driver        = drv;
-                slot->DeviceCount   = devCount;
-                slot->MaxStackDepth = maxDepth;
-                sd->Hooked          = TRUE;
-                g_HubSlotCount++;
-                g_HubSlotUsed       = TRUE;
+                sd->Hooked    = TRUE;
+                g_HubSlotUsed = TRUE;
 
-                LOG_INFO("    hook OK: orig=%p handler=%p",
-                         slot->Hook.Original, MyHubPnp);
+                LOG_INFO("    hook OK: orig=%p handler=%p", orig, MyHubPnp);
             } else {
+                /* 回滚: 把刚登记的 slot 撤掉, 绝不留下半成品 */
+                g_HubSlotCount--;
+                ObDereferenceObject(drv);
+                RtlZeroMemory(slot, sizeof(*slot));
                 LOG_ERROR("    hook failed: %08X", st);
             }
         } else {

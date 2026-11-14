@@ -140,56 +140,68 @@ static BOOLEAN DriverNameHasUsb(_In_ PDRIVER_OBJECT drv)
 }
 
 /*
- * StackHasUsbDriver - 设备的底层栈里有没有名字含 usb 的驱动
+ * IsUsbDriver - 判断一个驱动对象是否属于 USB 总线栈
  *
- * 用于覆盖 Ucx01000 这种名字不含 usb、但底层接着 USB 控制器的驱动。
- */
-static BOOLEAN StackHasUsbDriver(_In_ PDEVICE_OBJECT top)
-{
-    PDEVICE_OBJECT cur  = top;
-    PDEVICE_OBJECT next = NULL;
-    BOOLEAN        hit  = FALSE;
-
-    while (cur != NULL && !hit) {
-        if (DriverNameHasUsb(cur->DriverObject)) hit = TRUE;
-
-        next = IoGetLowerDeviceObject(cur);
-        if (cur != top) ObDereferenceObject(cur);
-        cur = next;
-        if (hit && cur != NULL) {
-            /* 命中了, 但 next 有引用需要释放 */
-            ObDereferenceObject(cur);
-            cur = NULL;
-            break;
-        }
-    }
-
-    /* 收尾: 如果循环因为 cur == NULL 结束, 没有额外引用需要释放 */
-    return hit;
-}
-
-/*
- * IsUsbDriver - 判断一个驱动对象是否属于 USB 栈
+ * ==================================================================
+ * 为什么不用「设备栈里含 usb 驱动」这个条件（踩过 0xCA 的教训）
+ * ==================================================================
+ *   之前用条件 B（下层设备栈里有名字含 usb 的驱动）会把一整条
+ *   功能驱动链都拉进来:
  *
- * 策略: 驱动名含 "usb" 或 任一设备的底层栈含 "usb" 驱动
+ *     BthEnum  -> BTHUSB -> usbhub      (蓝牙适配器)
+ *     RFCOMM   -> BTHUSB -> usbhub      (蓝牙串口)
+ *     mouclass -> mouhid -> ...         (鼠标类驱动)
+ *
+ *   这些都是「消费者」，不是 USB 总线管理者。它们的 PnP 状态机
+ *   由各自的类驱动严格维护，随便接管 IRP_MJ_PNP 会触发
+ *   0xCA PNP_DETECTED_FATAL_ERROR。
+ *
+ *   所以改成纯名字匹配 + 显式排除。
+ *
+ * ==================================================================
+ * 判定规则
+ * ==================================================================
+ *   1. 名字含 "bth" / "rfcomm" / "mouclass" / "kbdclass" / "mouhid"
+ *      / "game_base"  → 直接排除
+ *   2. 名字含 "usb"    → 是 USB 栈（含 usbuhci/usbehci/USBXHCI/
+ *                        usbhub/USBHUB3/usbccgp/HidUsb/vmusbmouse）
+ *   3. 名字含 "ucx"    → USB 控制器类扩展（Ucx01000，名字里没有 usb）
  */
 static BOOLEAN IsUsbDriver(_In_ PDRIVER_OBJECT drv)
 {
-    if (drv == NULL) return FALSE;
+    WCHAR name[128];
+    USHORT chars;
+    static const WCHAR *exclude[] = {
+        L"bth",        /* 蓝牙栈: BTHUSB / BthEnum / BthPan / BthMini */
+        L"rfcomm",     /* 蓝牙串口 */
+        L"mouclass",   /* 鼠标类驱动 */
+        L"kbdclass",   /* 键盘类驱动 */
+        L"mouhid",     /* 鼠标 HID 功能驱动 */
+        L"game_base",  /* 我们自己 */
+    };
 
-    /* 条件 A: 驱动名自带 usb */
-    if (DriverNameHasUsb(drv)) return TRUE;
+    if (drv == NULL || drv->DriverName.Buffer == NULL) return FALSE;
 
-    /* 条件 B: 设备栈里有 usb 驱动 */
-    for (PDEVICE_OBJECT dev = drv->DeviceObject; dev != NULL; dev = dev->NextDevice) {
-        if (StackHasUsbDriver(dev)) return TRUE;
+    chars = (USHORT)(drv->DriverName.Length / sizeof(WCHAR));
+    if (chars == 0) return FALSE;
+    if (chars >= ARRAY_SIZE(name)) chars = ARRAY_SIZE(name) - 1;
+
+    RtlCopyMemory(name, drv->DriverName.Buffer, (ULONG)chars * sizeof(WCHAR));
+    name[chars] = 0;
+
+    /* 1. 排除名单 */
+    for (ULONG i = 0; i < ARRAY_SIZE(exclude); i++) {
+        if (ContainsNoCase(name, exclude[i])) return FALSE;
     }
+
+    /* 2. USB 栈 */
+    if (ContainsNoCase(name, L"usb")) return TRUE;
+
+    /* 3. USB 控制器类扩展 */
+    if (ContainsNoCase(name, L"ucx")) return TRUE;
+
     return FALSE;
 }
-
-/*
- * CountDevices - 统计驱动的设备数
- */
 static ULONG CountDevices(_In_ PDRIVER_OBJECT drv)
 {
     ULONG n = 0;
