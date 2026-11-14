@@ -2,7 +2,7 @@
  * game_log.c - game_base 内核日志实现
  *
  * 输出前缀固定为 [game_base], 调用方不需要传 tag。
- * 这与 Logger.h 里硬编码 [CrossFireLogger] 的做法一致。
+ * 函数名由宏传 __FUNCTION__ 进来。
  *
  * 双通道:
  *   通道1 DbgPrintEx   - 按级别过滤, DebugView / WinDbg 可见 (仅 DBG 版)
@@ -15,9 +15,9 @@
  * 固定日志前缀
  * ==================================================================
  * 只在这里定义一次。输出形如:
- *   [game_base][1234567.890][WRN] resolve failed: C0000024
- *    ^^^^^^^^^^  ^^^^^^^^^^^  ^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^
- *    前缀(固定)  时间戳(秒.毫秒) 级别  消息正文
+ *   [game_base][2026-11-14 21:30:45.123][WRN][FwHookResolveDriver] resolve failed: C0000024
+ *    ^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^  ^^^  ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^
+ *    前缀(固定)  本地时间                  级别  函数名              消息
  */
 #define GAME_LOG_TAG    "game_base"
 
@@ -41,8 +41,6 @@ static KSPIN_LOCK      g_Lock;
  *
  * DbgPrintEx 的过滤级别数值越小越严重:
  *   ERROR(0) < WARNING(1) < TRACE(2) < INFO(3)
- *
- * DebugView 里可以设过滤条件, 比如设为 WARNING 就看不到 INFO/TRACE。
  */
 static const ULONG g_DpfltrLevel[] = {
     DPFLTR_INFO_LEVEL,      /* 下标 0 = LOG_LVL_INFO  */
@@ -50,6 +48,43 @@ static const ULONG g_DpfltrLevel[] = {
     DPFLTR_ERROR_LEVEL,     /* 下标 2 = LOG_LVL_ERR   */
     DPFLTR_TRACE_LEVEL      /* 下标 3 = LOG_LVL_DEBUG */
 };
+
+/* ==================== 时间戳转换 ==================== */
+
+/*
+ * LogTsToString - 1601 起的 100ns 计数 -> 可读本地时间
+ *
+ * ts   来自 KeQuerySystemTime 的原始值 (UTC)
+ * buf  输出缓冲
+ * len  缓冲长度
+ *
+ * 内部三步:
+ *   1. ExSystemTimeToLocalTime  UTC -> 本地时间 (考虑时区)
+ *   2. RtlTimeToTimeFields      拆成年/月/日/时/分/秒/毫秒
+ *   3. RtlStringCchPrintfA      格式化成字符串
+ *
+ * 输出: "2026-11-14 21:30:45.123"
+ */
+VOID LogTsToString(ULONGLONG ts, char *buf, ULONG len)
+{
+    LARGE_INTEGER li;
+    TIME_FIELDS   tf;
+
+    if (buf == NULL || len == 0) return;
+
+    li.QuadPart = (LONGLONG)ts;
+
+    /* UTC -> 本地时间 (读注册表的时区设置) */
+    ExSystemTimeToLocalTime(&li, &li);
+
+    /* 100ns 计数 -> 年月日时分秒 */
+    RtlTimeToTimeFields(&li, &tf);
+
+    RtlStringCchPrintfA(buf, len,
+                        "%04d-%02d-%02d %02d:%02d:%02d.%03d",
+                        tf.Year, tf.Month, tf.Day,
+                        tf.Hour, tf.Minute, tf.Second, tf.Milliseconds);
+}
 
 /* ==================== 初始化 / 清理 ==================== */
 
@@ -93,9 +128,10 @@ static const char *LevelName(ULONG level)
  * LogWrite - 所有日志宏最终都走到这里
  *
  * 参数:
- *   level  日志级别 (LOG_LVL_*), 决定 DbgPrintEx 过滤级别 + 记录里的标记位
- *   fmt    printf 风格格式串, 如 "device %p failed: %08X"
- *   ...    变参, 对应 fmt 里的占位符
+ *   level  日志级别 (LOG_LVL_*)
+ *   func   函数名, 宏自动传 __FUNCTION__
+ *   fmt    printf 风格格式串
+ *   ...    变参
  *
  * 两件事:
  *   1. (仅 DBG 版) 格式化后调用 DbgPrintEx 输出到调试器
@@ -104,15 +140,13 @@ static const char *LevelName(ULONG level)
  * 注意: 因为要对同一组变参格式化两次, 必须用 va_start/va_end 包裹两次,
  *       C 语言的 va_list 遍历一次后就失效了。
  */
-VOID LogWrite(ULONG level, const char *fmt, ...)
+VOID LogWrite(ULONG level, const char *func, const char *fmt, ...)
 {
     LOG_ENTRY     e;        /* 待写入的一条记录 */
     LARGE_INTEGER ts;       /* 系统时间戳 (100ns 单位) */
     va_list       ap;       /* 变参游标 */
     KIRQL         irql;     /* 加锁前的中断级别, 解锁时恢复 */
     LONG          idx;      /* 本次写入的下标 */
-
-    (VOID)level;            /* Release 版下面两个通道都不用 level 时消除警告 */
 
     /* 先取时间戳, 两个通道都要用 */
     KeQuerySystemTime(&ts);
@@ -121,21 +155,23 @@ VOID LogWrite(ULONG level, const char *fmt, ...)
 #ifdef DBG
     va_start(ap, fmt);
     {
-        char dbg[FW_MSG_MAX];   /* 栈上临时缓冲, 不占内核池 */
+        char dbg[FW_MSG_MAX];       /* 栈上临时缓冲, 不占内核池 */
+        char readable[48];          /* 可读时间 */
 
         /* 把变参按 fmt 格式化进 dbg */
         RtlStringCchVPrintfA(dbg, FW_MSG_MAX, fmt, ap);
 
-        /* 输出到调试器。级别决定是否被过滤掉。
-         * 最终形如: [game_base][1234567.890][WRN] resolve failed: C0000024 */
+        /* 转成可读时间, 避免输出一串原始计数 */
+        LogTsToString((ULONGLONG)ts.QuadPart, readable, sizeof(readable));
+
+        /* 输出到调试器。级别决定是否被过滤掉。 */
         if (level < ARRAYSIZE(g_DpfltrLevel)) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID,
                        g_DpfltrLevel[level],
-                       "[%s][%lu.%03lu][%s] %s\n",
-                       GAME_LOG_TAG,
-                       (ULONG)(ts.QuadPart / 10000000),
-                       (ULONG)((ts.QuadPart / 10000) % 1000),
-                       LevelName(level), dbg);
+                       "[%s][%s][%s][%s] %s\n",
+                       GAME_LOG_TAG, readable,
+                       LevelName(level), func ? func : "?",
+                       dbg);
         }
     }
     va_end(ap);
@@ -147,10 +183,10 @@ VOID LogWrite(ULONG level, const char *fmt, ...)
     e.Ts    = (ULONGLONG)ts.QuadPart;
     e.Level = level;
 
-    /* 固定前缀: 调用方不传, 这里写死 */
-    RtlStringCchCopyA(e.Tag, FW_MOD_MAX, GAME_LOG_TAG);
+    /* 函数名: 调用方经宏传入, 超长截断 */
+    RtlStringCchCopyA(e.Func, FW_FUNC_MAX, func ? func : "?");
 
-    /* 消息: 重新开始变参遍历 (第一次 va_start 已在上面 va_end 结束) */
+    /* 消息: 重新开始变参遍历 */
     va_start(ap, fmt);
     RtlStringCchVPrintfA(e.Msg, FW_MSG_MAX, fmt, ap);
     va_end(ap);
@@ -171,7 +207,7 @@ VOID LogWrite(ULONG level, const char *fmt, ...)
  *
  * 参数:
  *   out         调用方提供的输出结构 (3 环 IOCTL 的 SystemBuffer)
- *   maxEntries  最多拷贝多少条 (由 3 环给的缓冲区大小算出)
+ *   maxEntries  最多拷贝多少条
  *
  * 返回: 实际拷贝的条数
  *

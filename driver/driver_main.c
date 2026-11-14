@@ -39,9 +39,6 @@
 #include "feat.h"
 #include "game_base.h"      /* GAME_BASE_DEVICE_NAME / GAME_BASE_SYMLINK_NAME */
 
-/* 日志 tag: 用驱动名, 3 环里会显示 [game_base] */
-#define FW_DRV_NAME "game_base"
-
 /*
  * DriverUnload - 驱动卸载回调
  *

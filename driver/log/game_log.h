@@ -4,9 +4,15 @@
  * 设计参考: H:\Code\GameReverse\CrossFire\Logger\Logger.h
  *
  * 关键设计:
- *   - 调用方不传 tag, 前缀在 game_log.c 里固定为 [game_base]
+ *   - 前缀 [game_base] 在 game_log.c 里固定, 调用方不传
+ *   - 函数名由宏自动取 __FUNCTION__, 调用方也不传
  *   - Debug 版: 宏展开为实际调用 (DbgPrintEx + 环形缓冲)
  *   - Release 版: 宏展开为 do{}while(0), 零开销
+ *
+ * 日志格式:
+ *   [game_base][2026-11-14 21:30:45.123][WRN][FwHookResolveDriver] resolve failed: C0000024
+ *    ^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^  ^^^  ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^
+ *    固定前缀    本地时间                  级别  函数名              消息
  *
  * 用法:
  *   LOG_INFO ("device %p connected", dev);
@@ -41,18 +47,26 @@ VOID  LogInit(VOID);
 VOID  LogClear(VOID);
 
 /*
- * 核心写入函数。前缀 [game_base] 在实现里固定, 调用方不用关心。
+ * 核心写入函数, 所有日志宏最终都走到这里。
  *
- * level  - LOG_LVL_* 级别, 同时决定 DbgPrintEx 的过滤级别
+ * level  - LOG_LVL_* 级别
+ * func   - 函数名, 宏自动传 __FUNCTION__
  * fmt    - printf 风格格式串
  * ...    - 变参
- *
- * _Printf_format_string_ 是 SAL 注解, 让编译器检查参数类型是否匹配。
  */
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID LogWrite(_In_ ULONG level,
+              _In_opt_z_ const char *func,
               _In_z_ _Printf_format_string_ const char *fmt,
               ...);
+
+/*
+ * 把 1601 起的 100ns 计数转成可读的本地时间字符串。
+ * 输出格式: "2026-11-14 21:30:45.123"
+ *
+ * 驱动内部和 3 环都能用 (实现里用的是 RtlTimeToTimeFields)。
+ */
+VOID LogTsToString(_In_ ULONGLONG ts, _Out_writes_(len) char *buf, _In_ ULONG len);
 
 /*
  * 把环形缓冲里的记录按时间正序拷到 out。
@@ -62,16 +76,16 @@ ULONG LogDump(_Out_ LOG_DUMP *out, _In_ ULONG maxEntries);
 
 /* ==================== 宏 ====================
  *
- * 只有这 4 个宏, 调用方只传格式串和参数。
+ * 只传格式串和参数, 前缀和函数名都在内部处理。
  *
- *   Debug 版:   LOG_INFO(...)   ->  LogWrite(LOG_LVL_INFO, ...)   真正记录
- *   Release 版: LOG_INFO(...)   ->  do { } while (0)              编译器丢弃全部参数
+ *   Debug 版:   LOG_INFO(...)  ->  LogWrite(LOG_LVL_INFO, __FUNCTION__, ...)
+ *   Release 版: LOG_INFO(...)  ->  do { } while (0)   编译器丢弃全部参数
  */
 #ifdef DBG
-    #define LOG_INFO(fmt, ...)   LogWrite(LOG_LVL_INFO,  fmt, ##__VA_ARGS__)
-    #define LOG_WARN(fmt, ...)   LogWrite(LOG_LVL_WARN,  fmt, ##__VA_ARGS__)
-    #define LOG_ERROR(fmt, ...)  LogWrite(LOG_LVL_ERR,   fmt, ##__VA_ARGS__)
-    #define LOG_DEBUG(fmt, ...)  LogWrite(LOG_LVL_DEBUG, fmt, ##__VA_ARGS__)
+    #define LOG_INFO(fmt, ...)   LogWrite(LOG_LVL_INFO,  __FUNCTION__, fmt, ##__VA_ARGS__)
+    #define LOG_WARN(fmt, ...)   LogWrite(LOG_LVL_WARN,  __FUNCTION__, fmt, ##__VA_ARGS__)
+    #define LOG_ERROR(fmt, ...)  LogWrite(LOG_LVL_ERR,   __FUNCTION__, fmt, ##__VA_ARGS__)
+    #define LOG_DEBUG(fmt, ...)  LogWrite(LOG_LVL_DEBUG, __FUNCTION__, fmt, ##__VA_ARGS__)
 #else
     #define LOG_INFO(fmt, ...)   do { } while (0)
     #define LOG_WARN(fmt, ...)   do { } while (0)

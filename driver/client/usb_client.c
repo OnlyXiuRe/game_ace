@@ -396,14 +396,26 @@ int main(int argc, char **argv) {
     }
 
     if (!strcmp(argv[1], "log")) {
-        static FW_LOG_DUMP d;
+        static LOG_DUMP d;
         DWORD ret = 0;
         if (DeviceIoControl(h, IOCTL_FW_LOG_DUMP, NULL, 0, &d, sizeof(d), &ret, NULL)) {
-            printf("日志条目: %lu\n", d.Count);
+            printf("=== game_base 日志 (%lu 条) ===\n", d.Count);
             for (ULONG i = 0; i < d.Count; i++) {
-                const char *lv = d.Entries[i].Level == 2 ? "ERR" :
+                const char *lv = d.Entries[i].Level == 3 ? "DBG" :
+                                 d.Entries[i].Level == 2 ? "ERR" :
                                  d.Entries[i].Level == 1 ? "WRN" : "INF";
-                printf("[%s][%s] %s\n", lv, d.Entries[i].Tag, d.Entries[i].Msg);
+                /* 1601 起的 100ns 计数 -> FILETIME -> 本地时间 */
+                FILETIME ft, lft;
+                SYSTEMTIME st;
+                ULONGLONG ts = d.Entries[i].Ts;
+                ft.dwLowDateTime  = (DWORD)(ts & 0xFFFFFFFF);
+                ft.dwHighDateTime = (DWORD)(ts >> 32);
+                FileTimeToLocalFileTime(&ft, &lft);
+                FileTimeToSystemTime(&lft, &st);
+                printf("[%04d-%02d-%02d %02d:%02d:%02d.%03d][%s][%s] %s\n",
+                       st.wYear, st.wMonth, st.wDay,
+                       st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+                       lv, d.Entries[i].Func, d.Entries[i].Msg);
             }
         } else {
             printf("LOG ioctl failed (err=%lu)\n", GetLastError());
