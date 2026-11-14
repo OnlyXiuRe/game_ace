@@ -262,10 +262,35 @@ static NTSTATUS MyHubPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     }
 
     if (g_Unloading == 0) {
-        InterlockedIncrement(&g_InHook);
-        if (minor == IRP_MN_START_DEVICE)       TrackDevice(DeviceObject);
-        else if (minor == IRP_MN_REMOVE_DEVICE) UntrackDevice(DeviceObject);
-        InterlockedDecrement(&g_InHook);
+        KIRQL irql = KeGetCurrentIrql();
+
+        /*
+         * IRQL 约束（踩过蓝屏的教训）:
+         *   IRP_MJ_PNP 的派发函数并不保证在 PASSIVE_LEVEL 运行,
+         *   某些总线/电源路径会在 DISPATCH_LEVEL 下发 START_DEVICE。
+         *
+         *   TrackDevice -> QueryDeviceId -> IoGetDeviceProperty
+         *   这个 API 要求 PASSIVE_LEVEL (它会访问注册表/配置管理器,
+         *   可能引发分页 I/O)。在 DISPATCH_LEVEL 调用 = 立刻蓝屏。
+         *
+         *   所以 START_DEVICE 只在 PASSIVE_LEVEL 处理;
+         *   REMOVE_DEVICE 只动自旋锁保护的内存表, 任何 IRQL 都安全。
+         */
+        if (minor == IRP_MN_REMOVE_DEVICE) {
+            InterlockedIncrement(&g_InHook);
+            UntrackDevice(DeviceObject);
+            InterlockedDecrement(&g_InHook);
+        } else if (minor == IRP_MN_START_DEVICE) {
+            if (irql == PASSIVE_LEVEL) {
+                InterlockedIncrement(&g_InHook);
+                TrackDevice(DeviceObject);
+                InterlockedDecrement(&g_InHook);
+            } else {
+                /* IRQL 太高, 跳过记录但绝不阻断原驱动 */
+                LOG_WARN("MyHubPnp: skip START at IRQL %lu (dev=%p)",
+                         (ULONG)irql, DeviceObject);
+            }
+        }
     }
 
     return orig(DeviceObject, Irp);

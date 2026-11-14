@@ -115,15 +115,28 @@ static BOOLEAN ContainsNoCase(_In_ PCWSTR haystack, _In_ PCWSTR needle)
 
 /*
  * DriverNameHasUsb - 驱动名是否包含 "usb"
+ *
+ * 注意: 不能把 DriverName.Buffer 直接当 C 串用。
+ *       UNICODE_STRING 的 Buffer 只保证有 Length 个字节有效,
+ *       虽然内核里驱动名通常带结尾 0, 但依赖这个假设会越界读。
+ *       这里按 Length 拷贝到本地缓冲区后再比较。
  */
 static BOOLEAN DriverNameHasUsb(_In_ PDRIVER_OBJECT drv)
 {
+    WCHAR  name[128];
+    USHORT chars;
+
     if (drv == NULL) return FALSE;
     if (drv->DriverName.Buffer == NULL) return FALSE;
 
-    /* DriverName 是 UNICODE_STRING, Buffer 可能不是以 0 结尾,
-     * 但内核里驱动对象的名字都带结束符, 这里可以直接当 C 串用 */
-    return ContainsNoCase(drv->DriverName.Buffer, L"usb");
+    chars = (USHORT)(drv->DriverName.Length / sizeof(WCHAR));
+    if (chars == 0) return FALSE;
+    if (chars >= ARRAY_SIZE(name)) chars = ARRAY_SIZE(name) - 1;
+
+    RtlCopyMemory(name, drv->DriverName.Buffer, (ULONG)chars * sizeof(WCHAR));
+    name[chars] = 0;
+
+    return ContainsNoCase(name, L"usb");
 }
 
 /*
