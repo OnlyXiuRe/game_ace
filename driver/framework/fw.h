@@ -7,21 +7,14 @@
 #pragma once
 #include <ntddk.h>
 #include "fw_user.h"
+#include "game_log.h"
 
-/* ==================== 日志模块 ==================== */
-#define FW_LEVEL_INFO   0
-#define FW_LEVEL_WARN   1
-#define FW_LEVEL_ERR    2
-
-VOID  FwLogInit(VOID);
-VOID  FwLog(ULONG level, const CHAR *mod, const CHAR *fmt, ...);
-ULONG FwLogDump(FW_LOG_DUMP *out, ULONG max);
-VOID  FwLogClear(VOID);
-
-/* 便捷宏 (带模块前缀, 类似 ACE 的 [AntiKm]/[ANTIHW]) */
-#define FW_INFO(mod, fmt, ...)  FwLog(FW_LEVEL_INFO, mod, fmt, ##__VA_ARGS__)
-#define FW_WARN(mod, fmt, ...)  FwLog(FW_LEVEL_WARN, mod, fmt, ##__VA_ARGS__)
-#define FW_ERR(mod, fmt, ...)   FwLog(FW_LEVEL_ERR,  mod, fmt, ##__VA_ARGS__)
+/* ==================== 日志 (委托给 log/game_log.h) ==================== */
+/* 统一用 GL_* 宏, 这里保留 FW_* 作为别名以兼容现有模块 */
+#define FW_INFO(tag, fmt, ...)  GL_INFO(tag, fmt, ##__VA_ARGS__)
+#define FW_WARN(tag, fmt, ...)  GL_WARN(tag, fmt, ##__VA_ARGS__)
+#define FW_ERR(tag, fmt, ...)   GL_ERR (tag, fmt, ##__VA_ARGS__)
+#define FW_DBG(tag, fmt, ...)   GL_DBG (tag, fmt, ##__VA_ARGS__)
 
 /* ==================== Hook 模块 ==================== */
 typedef struct _FW_HOOK {

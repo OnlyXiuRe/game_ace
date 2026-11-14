@@ -65,17 +65,17 @@ NTSTATUS FwDispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     NTSTATUS st;
 
     if (code == IOCTL_FW_LOG_DUMP) {
-        if (buffer == NULL || outLen < sizeof(FW_LOG_DUMP)) {
+        if (buffer == NULL || outLen < sizeof(GL_DUMP)) {
             st = STATUS_BUFFER_TOO_SMALL;
         } else {
-            FW_LOG_DUMP *d = (FW_LOG_DUMP *)buffer;
-            ULONG maxEntries = (outLen - FIELD_OFFSET(FW_LOG_DUMP, Entries)) / sizeof(FW_LOG_ENTRY);
-            FwLogDump(d, maxEntries);
-            info = sizeof(FW_LOG_DUMP);
+            GL_DUMP *d = (GL_DUMP *)buffer;
+            ULONG maxEntries = (outLen - FIELD_OFFSET(GL_DUMP, Entries)) / sizeof(GL_ENTRY);
+            GlDump(d, maxEntries);
+            info = sizeof(GL_DUMP);
             st = STATUS_SUCCESS;
         }
     } else if (code == IOCTL_FW_LOG_CLEAR) {
-        FwLogClear();
+        GlClear();
         st = STATUS_SUCCESS;
     } else {
         const FW_FEATURE *f = FwFeatureFind(code);

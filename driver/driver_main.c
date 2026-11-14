@@ -35,7 +35,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     NTSTATUS st;
     UNREFERENCED_PARAMETER(RegistryPath);
 
-    FwLogInit();
+    GlInit();
     FW_INFO(FW_DRV_NAME, "=== game_base anti-cheat driver starting ===");
 
     DriverObject->DriverUnload = DriverUnload;
