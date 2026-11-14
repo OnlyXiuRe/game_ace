@@ -1,0 +1,64 @@
+;
+; usb_filter.inf - 自写 KMDF USB 控制传输驱动
+; 绑定到目标设备接口 (默认 KMBox 厂商接口 MI_01)
+;
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = USB
+ClassGuid   = {36FC9E60-C465-11CF-8056-444553540000}
+Provider    = %Provider%
+DriverVer   = 11/13/2026,1.0.0.0
+CatalogFile = usb_filter.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12          ; %windir%\system32\drivers
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+usb_filter.sys = 1,,
+
+[Manufacturer]
+%Provider% = DeviceList, NTamd64, NTarm64
+
+[DeviceList.NTamd64]
+%DeviceName% = usb_filter_Install, USB\VID_6688&PID_2021&MI_01
+
+[DeviceList.NTarm64]
+%DeviceName% = usb_filter_Install, USB\VID_6688&PID_2021&MI_01
+
+[usb_filter_Install.NT]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+usb_filter.sys
+
+[usb_filter_Install.NT.Services]
+AddService = usb_filter, 0x00000002, usb_filter_Service
+
+[usb_filter_Service]
+DisplayName   = %ServiceName%
+ServiceType   = 1        ; SERVICE_KERNEL_DRIVER
+StartType     = 3        ; SERVICE_DEMAND_START
+ErrorControl  = 1        ; SERVICE_ERROR_NORMAL
+ServiceBinary = %12%\usb_filter.sys
+
+[usb_filter_Install.NT.Wdf]
+KmdfService = usb_filter, usb_filter_wdfsect
+
+[usb_filter_wdfsect]
+KmdfLibraryVersion = 1.15
+
+[usb_filter_Install.NT.hw]
+AddReg = usb_filter_AddReg
+
+[usb_filter_AddReg]
+HKR,,DeviceInterfaceGUIDs,0x10000,"{A5DCBF11-6530-11D2-901F-00C04FB951ED}"
+
+[Strings]
+Provider    = "KMBoxDetect"
+DeviceName  = "KMBox USB Control Filter"
+ServiceName = "KMBox USB Control Filter Driver"
+DiskName    = "KMBox USB Control Filter Driver Install Disk"
