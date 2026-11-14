@@ -2,37 +2,45 @@
  * driver_scan.c - 动态发现所有 USB 驱动
  *
  * ==================================================================
- * 为什么不用 DeviceType 过滤 (踩过的坑)
+ * 判定依据: 总线类型 GUID, 不是驱动名
  * ==================================================================
- *   最初我用 dev->DeviceType == 0x22 判断 USB 设备, 结果几乎所有驱动
- *   都被误判为 USB 驱动 (PEAUTH / DXGKrnl / SoftwareDevice / 甚至我们
- *   自己的 game_base)。
+ * 一开始我用 DEVICE_OBJECT->DeviceType == 0x22 判断 USB, 结果几乎所有
+ * 驱动都被误判 (PEAUTH / DXGKrnl / SoftwareDevice / 甚至我们自己的
+ * game_base)。原因有据可查 —— usbiodef.h 里就写着:
  *
- *   原因: WDK 里根本没有 FILE_DEVICE_USB 这个常量!
- *         FILE_DEVICE_UNKNOWN = 0x00000022
- *         USBHUB3 的 FDO DeviceType 也是 0x22 (即 UNKNOWN)
+ *     #define FILE_DEVICE_USB  FILE_DEVICE_UNKNOWN
  *
- *   所以 DeviceType 完全是 "未分类" 的默认值, 无法区分 USB。
+ * 也就是说 DeviceType 对 USB 在结构上就没有区分度。
+ *
+ * 正确做法是问总线枚举器: 这个设备挂在哪种总线上。Windows 为此提供
+ * 了 DevicePropertyBusTypeGuid (wdm.h: = 0xc), USB 设备返回
+ * GUID_BUS_TYPE_USB (wdmguid.h):
+ *
+ *     DEFINE_GUID(GUID_BUS_TYPE_USB, 0x9d7debbc, 0xc85d, 0x11d1,
+ *                 0x9e, 0xb4, 0x00, 0x60, 0x08, 0xc3, 0xa1, 0x9a);
+ *
+ * 这是枚举器 (PCI / USB / ACPI / ROOT / SWD) 在创建设备时写入的类型
+ * 标记, 和驱动文件名完全无关。
  *
  * ==================================================================
- * 实际可用的过滤条件
+ * 为什么还要排除名单
  * ==================================================================
- *   条件 A: 驱动名包含 "usb" (不区分大小写)
- *     usbuhci / usbehci / USBXHCI / usbhub / USBHUB3 / usbccgp
- *     HidUsb / BTHUSB / vmusbmouse / ucxcx0000...
+ * 总线判定会命中真实挂在 USB 上的所有设备, 包括蓝牙适配器:
  *
- *   条件 B: 设备的底层栈里有名字含 "usb" 的驱动
- *     覆盖 Ucx01000 (USB 控制器扩展, 名字里没有 usb,
- *     但它的下层设备挂在 USBXHCI 上)
+ *     BTHUSB   -> 设备 PDO 是 USB     (命中)
+ *     BthEnum  -> 挂在 BTHUSB 下      (PDO 不是 USB, 不命中)
+ *     RFCOMM   -> 挂在 BTHUSB 下      (不命中)
  *
- *   两个条件任一满足即认为是 USB 驱动。
+ * 但 BTHUSB 这类是「功能驱动」不是 USB 总线管理者, 接管它们的
+ * IRP_MJ_PNP 会破坏其状态机 (实测触发 0xCA PNP_DETECTED_FATAL_ERROR)。
+ * 所以再加一层排除名单, 把消费者驱动剔掉。
  *
  * ==================================================================
  * 目录枚举的正确姿势
  * ==================================================================
- *   ZwQueryDirectoryObject 必须用 ReturnSingleEntry = TRUE!
- *   传 FALSE 时内核把所有条目打包进缓冲区, 只能解析第一个结构,
- *   后面的需要自己按 UNICODE_STRING 长度推算, 极易出错。
+ * ZwQueryDirectoryObject 必须用 ReturnSingleEntry = TRUE。
+ * 传 FALSE 时内核把所有条目打包进缓冲区, 只能解析第一个结构,
+ * 后面的要自己按 UNICODE_STRING 长度推算, 极易出错 (实测只扫到 1 个)。
  */
 #include "module.h"
 #include "game_base.h"
@@ -48,9 +56,12 @@
 /* 目录枚举的缓冲区大小 */
 #define SCAN_DIR_BUFFER  4096
 
+/* 最多跟踪的 USB 驱动数 */
+#define SCAN_MAX_DRIVERS 64
+
 /* ================= WDK 未声明的内核 API ================= */
 
-/* 对象目录条目（ZwQueryDirectoryObject 的输出结构） */
+/* 对象目录条目 (ZwQueryDirectoryObject 的输出结构) */
 typedef struct _OBJECT_DIRECTORY_INFORMATION {
     UNICODE_STRING Name;
     UNICODE_STRING TypeName;
@@ -73,8 +84,25 @@ NTSYSAPI NTSTATUS NTAPI ZwQueryDirectoryObject(
 /* ntifs.h 有声明, ntddk.h 没有 */
 extern PDEVICE_OBJECT IoGetLowerDeviceObject(_In_ PDEVICE_OBJECT DeviceObject);
 
-/* 最多跟踪的 USB 驱动数 */
-#define SCAN_MAX_DRIVERS 64
+/* ================= 常量 ================= */
+
+/*
+ * GUID_BUS_TYPE_USB - USB 总线类型标识 (来源 wdmguid.h)
+ */
+static const GUID g_BusTypeUsb =
+    { 0x9d7debbc, 0xc85d, 0x11d1, { 0x9e, 0xb4, 0x00, 0x60, 0x08, 0xc3, 0xa1, 0x9a } };
+
+/*
+ * 排除名单 - 总线判定命中, 但不该 hook 的功能性驱动
+ */
+static const WCHAR *g_ExcludeDrivers[] = {
+    L"bth",        /* 蓝牙栈: BTHUSB / BthEnum / BthPan / BthMini */
+    L"rfcomm",     /* 蓝牙串口 */
+    L"mouclass",   /* 鼠标类驱动 */
+    L"kbdclass",   /* 键盘类驱动 */
+    L"mouhid",     /* 鼠标 HID 功能驱动 */
+    L"game_base",  /* 我们自己 */
+};
 
 /* ================= 状态 ================= */
 
@@ -85,15 +113,12 @@ static ULONG            g_UsbDriverCount = 0;
 
 /*
  * ContainsNoCase - 不区分大小写的子串查找
- *
- * 为什么不用 wcsstr: wcsstr 区分大小写, 而 \Driver\HidUsb 里是混合大小写,
- * 我们需要同时匹配 "usb" / "Usb" / "USB"。
  */
 static BOOLEAN ContainsNoCase(_In_ PCWSTR haystack, _In_ PCWSTR needle)
 {
-    if (haystack == NULL || needle == NULL) return FALSE;
-
     size_t hlen, nlen, i, j;
+
+    if (haystack == NULL || needle == NULL) return FALSE;
 
     for (hlen = 0; haystack[hlen]; hlen++) {}
     for (nlen = 0; needle[nlen]; nlen++)   {}
@@ -114,94 +139,151 @@ static BOOLEAN ContainsNoCase(_In_ PCWSTR haystack, _In_ PCWSTR needle)
 }
 
 /*
- * DriverNameHasUsb - 驱动名是否包含 "usb"
+ * WalkToPdo - 沿设备栈走到底层 PDO
  *
- * 注意: 不能把 DriverName.Buffer 直接当 C 串用。
- *       UNICODE_STRING 的 Buffer 只保证有 Length 个字节有效,
- *       虽然内核里驱动名通常带结尾 0, 但依赖这个假设会越界读。
- *       这里按 Length 拷贝到本地缓冲区后再比较。
+ * 返回: PDO (持有一份引用, 调用方负责 ObDereferenceObject);
+ *       如果设备本身就是栈底, 返回 NULL (调用方直接用它)。
  */
-static BOOLEAN DriverNameHasUsb(_In_ PDRIVER_OBJECT drv)
+static PDEVICE_OBJECT WalkToPdo(_In_ PDEVICE_OBJECT dev)
+{
+    PDEVICE_OBJECT cur = dev;
+    PDEVICE_OBJECT lower;
+
+    if (dev == NULL) return NULL;
+
+    while ((lower = IoGetLowerDeviceObject(cur)) != NULL) {
+        if (cur != dev) ObDereferenceObject(cur);
+        cur = lower;
+    }
+
+    return (cur == dev) ? NULL : cur;
+}
+
+/*
+ * IsUsbBusType - 用总线类型 GUID 判断一个设备对象是不是 USB 设备
+ *
+ * 这是「设备类型」的正确判定方式, 和驱动名完全无关。
+ */
+static BOOLEAN IsUsbBusType(_In_ PDEVICE_OBJECT pdo)
+{
+    GUID     busType;
+    ULONG    len = 0;
+    NTSTATUS st;
+
+    if (pdo == NULL) return FALSE;
+
+    RtlZeroMemory(&busType, sizeof(busType));
+    st = IoGetDeviceProperty(pdo, DevicePropertyBusTypeGuid,
+                             sizeof(busType), &busType, &len);
+    if (!NT_SUCCESS(st)) return FALSE;
+
+    return (RtlCompareMemory(&busType, &g_BusTypeUsb, sizeof(GUID)) == sizeof(GUID));
+}
+
+/*
+ * ProbeBusType - 读设备的 BusTypeGuid 和 EnumeratorName, 仅用于日志
+ *
+ * 打印出来的数据可以验证「总线判定」是否比「名字匹配」更准确。
+ */
+static VOID ProbeBusType(_In_ PDEVICE_OBJECT dev, _In_ PCWSTR driverName)
+{
+    PDEVICE_OBJECT pdo;
+    GUID           busType;
+    ULONG          len = 0;
+    NTSTATUS       st;
+    WCHAR          enumName[64];
+    NTSTATUS       st2;
+    BOOLEAN        isUsb;
+
+    if (dev == NULL) return;
+
+    pdo = WalkToPdo(dev);
+    {
+        PDEVICE_OBJECT target = (pdo != NULL) ? pdo : dev;
+
+        RtlZeroMemory(&busType, sizeof(busType));
+        st = IoGetDeviceProperty(target, DevicePropertyBusTypeGuid,
+                                 sizeof(busType), &busType, &len);
+
+        RtlZeroMemory(enumName, sizeof(enumName));
+        st2 = IoGetDeviceProperty(target, DevicePropertyEnumeratorName,
+                                  sizeof(enumName) - sizeof(WCHAR),
+                                  enumName, &len);
+
+        isUsb = IsUsbBusType(target);
+
+        enumName[ARRAY_SIZE(enumName) - 1] = 0;
+
+        LOG_INFO("    probe %wZ: busguid=%08X-%04X-%04X st=%08X enum=%ws st=%08X usb=%d",
+                 driverName,
+                 busType.Data1, busType.Data2, busType.Data3, st,
+                 NT_SUCCESS(st2) ? enumName : L"?",
+                 st2,
+                 isUsb);
+
+        if (pdo != NULL) ObDereferenceObject(pdo);
+    }
+}
+
+/*
+ * DeviceIsUsb - 判断一个设备（不看驱动名）是不是 USB 设备
+ */
+static BOOLEAN DeviceIsUsb(_In_ PDEVICE_OBJECT dev)
+{
+    PDEVICE_OBJECT pdo;
+    BOOLEAN        result;
+
+    if (dev == NULL) return FALSE;
+
+    pdo = WalkToPdo(dev);
+    if (pdo != NULL) {
+        result = IsUsbBusType(pdo);
+        ObDereferenceObject(pdo);
+    } else {
+        result = IsUsbBusType(dev);   /* 设备本身就是栈底 */
+    }
+    return result;
+}
+
+/*
+ * IsUsbDriver - 判断驱动是否管理 USB 设备
+ *
+ * 判据:
+ *   1. 驱动名不在排除名单里
+ *   2. 该驱动的任一设备, 其底层 PDO 的 BusTypeGuid == GUID_BUS_TYPE_USB
+ */
+static BOOLEAN IsUsbDriver(_In_ PDRIVER_OBJECT drv)
 {
     WCHAR  name[128];
     USHORT chars;
 
     if (drv == NULL) return FALSE;
-    if (drv->DriverName.Buffer == NULL) return FALSE;
 
-    chars = (USHORT)(drv->DriverName.Length / sizeof(WCHAR));
-    if (chars == 0) return FALSE;
-    if (chars >= ARRAY_SIZE(name)) chars = ARRAY_SIZE(name) - 1;
+    /* ---- 1. 排除功能性消费者驱动 ---- */
+    if (drv->DriverName.Buffer != NULL) {
+        chars = (USHORT)(drv->DriverName.Length / sizeof(WCHAR));
+        if (chars > 0) {
+            if (chars >= ARRAY_SIZE(name)) chars = ARRAY_SIZE(name) - 1;
+            RtlCopyMemory(name, drv->DriverName.Buffer, (ULONG)chars * sizeof(WCHAR));
+            name[chars] = 0;
 
-    RtlCopyMemory(name, drv->DriverName.Buffer, (ULONG)chars * sizeof(WCHAR));
-    name[chars] = 0;
-
-    return ContainsNoCase(name, L"usb");
-}
-
-/*
- * IsUsbDriver - 判断一个驱动对象是否属于 USB 总线栈
- *
- * ==================================================================
- * 为什么不用「设备栈里含 usb 驱动」这个条件（踩过 0xCA 的教训）
- * ==================================================================
- *   之前用条件 B（下层设备栈里有名字含 usb 的驱动）会把一整条
- *   功能驱动链都拉进来:
- *
- *     BthEnum  -> BTHUSB -> usbhub      (蓝牙适配器)
- *     RFCOMM   -> BTHUSB -> usbhub      (蓝牙串口)
- *     mouclass -> mouhid -> ...         (鼠标类驱动)
- *
- *   这些都是「消费者」，不是 USB 总线管理者。它们的 PnP 状态机
- *   由各自的类驱动严格维护，随便接管 IRP_MJ_PNP 会触发
- *   0xCA PNP_DETECTED_FATAL_ERROR。
- *
- *   所以改成纯名字匹配 + 显式排除。
- *
- * ==================================================================
- * 判定规则
- * ==================================================================
- *   1. 名字含 "bth" / "rfcomm" / "mouclass" / "kbdclass" / "mouhid"
- *      / "game_base"  → 直接排除
- *   2. 名字含 "usb"    → 是 USB 栈（含 usbuhci/usbehci/USBXHCI/
- *                        usbhub/USBHUB3/usbccgp/HidUsb/vmusbmouse）
- *   3. 名字含 "ucx"    → USB 控制器类扩展（Ucx01000，名字里没有 usb）
- */
-static BOOLEAN IsUsbDriver(_In_ PDRIVER_OBJECT drv)
-{
-    WCHAR name[128];
-    USHORT chars;
-    static const WCHAR *exclude[] = {
-        L"bth",        /* 蓝牙栈: BTHUSB / BthEnum / BthPan / BthMini */
-        L"rfcomm",     /* 蓝牙串口 */
-        L"mouclass",   /* 鼠标类驱动 */
-        L"kbdclass",   /* 键盘类驱动 */
-        L"mouhid",     /* 鼠标 HID 功能驱动 */
-        L"game_base",  /* 我们自己 */
-    };
-
-    if (drv == NULL || drv->DriverName.Buffer == NULL) return FALSE;
-
-    chars = (USHORT)(drv->DriverName.Length / sizeof(WCHAR));
-    if (chars == 0) return FALSE;
-    if (chars >= ARRAY_SIZE(name)) chars = ARRAY_SIZE(name) - 1;
-
-    RtlCopyMemory(name, drv->DriverName.Buffer, (ULONG)chars * sizeof(WCHAR));
-    name[chars] = 0;
-
-    /* 1. 排除名单 */
-    for (ULONG i = 0; i < ARRAY_SIZE(exclude); i++) {
-        if (ContainsNoCase(name, exclude[i])) return FALSE;
+            for (ULONG i = 0; i < ARRAY_SIZE(g_ExcludeDrivers); i++) {
+                if (ContainsNoCase(name, g_ExcludeDrivers[i])) return FALSE;
+            }
+        }
     }
 
-    /* 2. USB 栈 */
-    if (ContainsNoCase(name, L"usb")) return TRUE;
-
-    /* 3. USB 控制器类扩展 */
-    if (ContainsNoCase(name, L"ucx")) return TRUE;
+    /* ---- 2. 总线类型判定 ---- */
+    for (PDEVICE_OBJECT dev = drv->DeviceObject; dev != NULL; dev = dev->NextDevice) {
+        if (DeviceIsUsb(dev)) return TRUE;
+    }
 
     return FALSE;
 }
+
+/*
+ * CountDevices - 统计驱动的设备数
+ */
 static ULONG CountDevices(_In_ PDRIVER_OBJECT drv)
 {
     ULONG n = 0;
@@ -221,8 +303,8 @@ static VOID ReleaseAll(VOID)
         }
         if (g_UsbDrivers[i].Name.Buffer != NULL) {
             ExFreePool(g_UsbDrivers[i].Name.Buffer);
-            g_UsbDrivers[i].Name.Buffer    = NULL;
-            g_UsbDrivers[i].Name.Length    = 0;
+            g_UsbDrivers[i].Name.Buffer       = NULL;
+            g_UsbDrivers[i].Name.Length       = 0;
             g_UsbDrivers[i].Name.MaximumLength = 0;
         }
     }
@@ -274,7 +356,7 @@ ULONG DriverScanFindAll(PVOID hookContext)
         return 0;
     }
 
-    LOG_INFO("=== scanning \\Driver directory ===");
+    LOG_INFO("=== scanning \\Driver directory (bus-type GUID based) ===");
 
     for (;;) {
         POBJECT_DIRECTORY_INFORMATION info;
@@ -316,14 +398,13 @@ ULONG DriverScanFindAll(PVOID hookContext)
         /* 是 USB 驱动 */
         if (g_UsbDriverCount < SCAN_MAX_DRIVERS) {
             SCAN_USB_DRIVER *slot = &g_UsbDrivers[g_UsbDriverCount];
-            USHORT nameBytes = info->Name.Length;
+            USHORT           nameBytes = info->Name.Length;
 
             RtlZeroMemory(slot, sizeof(*slot));
             slot->Driver      = drv;          /* 保留引用 */
             slot->DeviceCount = CountDevices(drv);
             slot->Hooked      = FALSE;
 
-            /* 拷贝驱动名 */
             slot->Name.MaximumLength = (USHORT)(nameBytes + sizeof(WCHAR));
             slot->Name.Buffer = (PWCHAR)ExAllocatePoolWithTag(
                 NonPagedPool, slot->Name.MaximumLength, 'nSnD');
@@ -338,6 +419,9 @@ ULONG DriverScanFindAll(PVOID hookContext)
 
             LOG_INFO("  USB driver: %wZ (DrvObj=%p devices=%lu)",
                      &slot->Name, drv, slot->DeviceCount);
+
+            /* 打印第一个设备的总线类型, 用于验证判定依据 */
+            ProbeBusType(drv->DeviceObject, &slot->Name);
         } else {
             LOG_WARN("  table full (%lu), skip %wZ", SCAN_MAX_DRIVERS, &info->Name);
             ObDereferenceObject(drv);
