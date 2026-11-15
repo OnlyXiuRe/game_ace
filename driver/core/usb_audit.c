@@ -1070,7 +1070,7 @@ static NTSTATUS DoNodes(PVOID buffer, ULONG outLen, PULONG info)
 static NTSTATUS DoFullEnum(PVOID buffer, ULONG outLen, PULONG info)
 {
     USB_FULL_LIST_UM *out;
-    USB_FULL_LIST     list;
+    USB_FULL_LIST    *list;
     NTSTATUS          st;
 
     if (buffer == NULL || outLen < sizeof(USB_FULL_LIST_UM))
@@ -1082,62 +1082,72 @@ static NTSTATUS DoFullEnum(PVOID buffer, ULONG outLen, PULONG info)
     out = (USB_FULL_LIST_UM *)buffer;
     RtlZeroMemory(out, sizeof(USB_FULL_LIST_UM));
 
-    RtlZeroMemory(&list, sizeof(list));
-    st = UsbHubEnumAll(&list);
+    /*
+     * USB_FULL_LIST ≈ 32 × 3.2KB ≈ 102KB。绝不能放内核栈（12KB）。
+     * 之前这里写成 USB_FULL_LIST list; 是栈变量，IOCTL_USB_FULL_ENUM
+     * 一调就栈溢出蓝屏（0x7F / C0000420）。改成池分配。
+     */
+    list = (USB_FULL_LIST *)ExAllocatePoolWithTag(NonPagedPool,
+                                                  sizeof(USB_FULL_LIST), 'bHsU');
+    if (list == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+
+    RtlZeroMemory(list, sizeof(*list));
+    st = UsbHubEnumAll(list);
 
     out->LastStatus = (ULONG)st;
-    out->HubCount   = list.HubCount;
+    out->HubCount   = list->HubCount;
     *info = sizeof(USB_FULL_LIST_UM);
 
-    if (!NT_SUCCESS(st)) return st;
+    if (NT_SUCCESS(st)) {
+        for (ULONG i = 0; i < list->Count && i < USB_FULL_MAX_UM; i++) {
+            USB_DEV_FULL *s = &list->Devs[i];
+            USB_DEV_UM   *d = &out->Devs[i];
+            ULONG         k;
 
-    for (ULONG i = 0; i < list.Count && i < USB_FULL_MAX_UM; i++) {
-        USB_DEV_FULL *s = &list.Devs[i];
-        USB_DEV_UM   *d = &out->Devs[i];
-        ULONG         k;
+            d->HubIndex          = s->HubIndex;
+            d->PortNumber        = s->PortNumber;
+            d->Speed             = s->Speed;
+            d->Suspicious        = UsbHubIsSuspiciousComposite(s) ? 1 : 0;
+            d->Vid               = s->Vid;
+            d->Pid               = s->Pid;
+            d->BcdDevice         = s->BcdDevice;
+            d->BcdUSB            = s->BcdUSB;
+            d->DeviceClass       = s->DeviceClass;
+            d->DeviceSubClass    = s->DeviceSubClass;
+            d->DeviceProtocol    = s->DeviceProtocol;
+            d->NumConfigurations = s->NumConfigurations;
+            d->ConfigValue       = s->ConfigValue;
+            d->NumInterfaces     = s->NumInterfaces;
+            d->ConfigTotalLength = s->ConfigTotalLength;
 
-        d->HubIndex          = s->HubIndex;
-        d->PortNumber        = s->PortNumber;
-        d->Speed             = s->Speed;
-        d->Suspicious        = UsbHubIsSuspiciousComposite(s) ? 1 : 0;
-        d->Vid               = s->Vid;
-        d->Pid               = s->Pid;
-        d->BcdDevice         = s->BcdDevice;
-        d->BcdUSB            = s->BcdUSB;
-        d->DeviceClass       = s->DeviceClass;
-        d->DeviceSubClass    = s->DeviceSubClass;
-        d->DeviceProtocol    = s->DeviceProtocol;
-        d->NumConfigurations = s->NumConfigurations;
-        d->ConfigValue       = s->ConfigValue;
-        d->NumInterfaces     = s->NumInterfaces;
-        d->ConfigTotalLength = s->ConfigTotalLength;
+            RtlStringCchCopyW(d->Manufacturer, USB_STR_MAX_UM, s->Manufacturer);
+            RtlStringCchCopyW(d->Product,      USB_STR_MAX_UM, s->Product);
+            RtlStringCchCopyW(d->Serial,       USB_STR_MAX_UM, s->Serial);
 
-        RtlStringCchCopyW(d->Manufacturer, USB_STR_MAX_UM, s->Manufacturer);
-        RtlStringCchCopyW(d->Product,      USB_STR_MAX_UM, s->Product);
-        RtlStringCchCopyW(d->Serial,       USB_STR_MAX_UM, s->Serial);
+            d->IfaceCount = (s->IfaceCount > USB_IFACE_MAX_UM)
+                            ? USB_IFACE_MAX_UM : s->IfaceCount;
+            for (k = 0; k < d->IfaceCount; k++) {
+                d->Ifaces[k].Number    = s->Ifaces[k].InterfaceNumber;
+                d->Ifaces[k].Class     = s->Ifaces[k].Class;
+                d->Ifaces[k].SubClass  = s->Ifaces[k].SubClass;
+                d->Ifaces[k].Protocol  = s->Ifaces[k].Protocol;
+                d->Ifaces[k].Endpoints = s->Ifaces[k].EndpointCount;
+                d->Ifaces[k].HasReport = s->Ifaces[k].HasReportDesc;
+                d->Ifaces[k].ReportLen = s->Ifaces[k].ReportDescLen;
+                d->Ifaces[k].HidDescLen  = s->Ifaces[k].HidDescLen;
+                d->Ifaces[k].HidBcdHID   = s->Ifaces[k].HidBcdHID;
+                d->Ifaces[k].HidCountry  = s->Ifaces[k].HidCountry;
+                d->Ifaces[k].HidNumDesc  = s->Ifaces[k].HidNumDesc;
+                d->Ifaces[k].HasPhysDesc = s->Ifaces[k].HasPhysDesc;
+                d->Ifaces[k].PhysDescLen = s->Ifaces[k].PhysDescLen;
+            }
 
-        d->IfaceCount = (s->IfaceCount > USB_IFACE_MAX_UM)
-                        ? USB_IFACE_MAX_UM : s->IfaceCount;
-        for (k = 0; k < d->IfaceCount; k++) {
-            d->Ifaces[k].Number    = s->Ifaces[k].InterfaceNumber;
-            d->Ifaces[k].Class     = s->Ifaces[k].Class;
-            d->Ifaces[k].SubClass  = s->Ifaces[k].SubClass;
-            d->Ifaces[k].Protocol  = s->Ifaces[k].Protocol;
-            d->Ifaces[k].Endpoints = s->Ifaces[k].EndpointCount;
-            d->Ifaces[k].HasReport = s->Ifaces[k].HasReportDesc;
-            d->Ifaces[k].ReportLen = s->Ifaces[k].ReportDescLen;
-            d->Ifaces[k].HidDescLen  = s->Ifaces[k].HidDescLen;
-            d->Ifaces[k].HidBcdHID   = s->Ifaces[k].HidBcdHID;
-            d->Ifaces[k].HidCountry  = s->Ifaces[k].HidCountry;
-            d->Ifaces[k].HidNumDesc  = s->Ifaces[k].HidNumDesc;
-            d->Ifaces[k].HasPhysDesc = s->Ifaces[k].HasPhysDesc;
-            d->Ifaces[k].PhysDescLen = s->Ifaces[k].PhysDescLen;
+            out->Count++;
         }
-
-        out->Count++;
     }
 
-    return STATUS_SUCCESS;
+    ExFreePoolWithTag(list, 'bHsU');
+    return NT_SUCCESS(st) ? STATUS_SUCCESS : st;
 }
 
 /*
