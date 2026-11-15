@@ -1363,21 +1363,18 @@ static VOID RunFullEnum(VOID)
     ExFreePoolWithTag(list, 'bHsU');
 
     /*
-     * ★ 验证：hub 是否允许任意 SetupPacket
-     *   如果 GET_STATUS / GET_CONFIGURATION 都能通，说明
-     *   IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION 实际上
-     *   是个通用控制传输通道，fuzz/diff 就能直接在驱动里做。
+     * ★ 这里禁止跑任何控制传输自测
+     *
+     * 之前把 UsbHubRawControlSelfTest / UsbHubUrbProbeSelfTest /
+     * UsbUrbControlSelfTest 放在 DriverEntry 自动执行，结果加载即
+     * 0x7E (SYSTEM_THREAD_EXCEPTION_NOT_HANDLED, C0000005) 蓝屏，
+     * 出错点在第一次 UsbHubRawControlToDevice。
+     *
+     * 在 DriverEntry 里主动向一个正被 mouhid 持有的设备发任意控制
+     * 传输是不可靠的：设备/hub 栈此时并不保证接受这种越权请求。
+     * 这类探测必须由 3 环在设备稳定运行后按需触发
+     * （IOCTL_USB_RAW_CONTROL），不能放在驱动初始化路径上。
      */
-    UsbHubRawControlSelfTest();
-
-    /*
-     * ★ 第二条路：走 GUID_DEVINTERFACE_USB_DEVICE + URB。
-     *   如果通了，URB_FUNCTION_CONTROL_TRANSFER 就能发任意 SetupPacket。
-     */
-    UsbHubUrbProbeSelfTest();
-
-    /* ★ 第三段：任意控制传输（fuzz/diff 的基础） */
-    UsbUrbControlSelfTest();
 }
 
 NTSTATUS UsbAuditInit(VOID)

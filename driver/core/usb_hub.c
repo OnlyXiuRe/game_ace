@@ -525,14 +525,32 @@ NTSTATUS UsbHubEnumAll(USB_FULL_LIST *List)
             totalPorts += ports;
 
             for (ULONG port = 1; port <= ports; port++) {
-                USB_DEV_FULL d;
+                /*
+                 * USB_DEV_FULL 现在约 3.2KB（8 个接口 × 报告描述符缓冲）。
+                 * 不要放栈上 —— 内核栈只有 12KB，DriverEntry 的调用链
+                 * DriverEntry -> UsbAuditInit -> RunFullEnum -> UsbHubEnumAll
+                 * -> QueryPortDevice 叠加起来很容易爆栈。
+                 */
+                USB_DEV_FULL *d;
 
                 if (devCount >= USB_FULL_MAX) break;
-                if (!QueryPortDevice(hub, hubIndex, port, &d)) continue;
 
-                RtlStringCchCopyW(d.HubPath, 128, p);
-                List->Devs[devCount] = d;
-                devCount++;
+                d = (USB_DEV_FULL *)ExAllocatePoolWithTag(
+                        NonPagedPool, sizeof(USB_DEV_FULL), 'bHsU');
+                if (d == NULL) {
+                    LOG_ERROR("alloc USB_DEV_FULL failed");
+                    break;
+                }
+
+                RtlZeroMemory(d, sizeof(*d));
+
+                if (QueryPortDevice(hub, hubIndex, port, d)) {
+                    RtlStringCchCopyW(d->HubPath, 128, p);
+                    List->Devs[devCount] = *d;
+                    devCount++;
+                }
+
+                ExFreePoolWithTag(d, 'bHsU');
             }
 
             ObDereferenceObject(fo);    /* 同时释放 hub 引用 */
@@ -552,14 +570,21 @@ NTSTATUS UsbHubEnumAll(USB_FULL_LIST *List)
     List->HubCount   = hubIndex;
     List->LastStatus = 0;
 
-    /* 缓存一份 */
-    KeAcquireSpinLock(&g_Lock, &irql);
+    /*
+     * 缓存一份快照
+     *
+     * 不要放进自旋锁里：g_Last 约 32 × 3.2KB = 102KB，RtlZeroMemory
+     * 加上 16KB 的拷贝在 DISPATCH_LEVEL 下持锁执行代价很大。
+     * 缓存只在 PASSIVE_LEVEL 被读（IOCTL 处理路径），
+     * 先把 Count 置 0、拷贝完再置真实值，读者看到的要么是空表
+     * 要么是完整的新快照，不会读到半成品。
+     */
+    g_LastCount  = 0;
     RtlZeroMemory(g_Last, sizeof(g_Last));
     for (ULONG i = 0; i < devCount && i < USB_FULL_MAX; i++)
         g_Last[i] = List->Devs[i];
-    g_LastCount  = (LONG)devCount;
     g_LastStatus = 0;
-    KeReleaseSpinLock(&g_Lock, irql);
+    g_LastCount  = (LONG)devCount;
 
     LOG_INFO("=== USB hub enum done: %lu hub(s), %lu port(s), %lu device(s) ===",
              hubIndex, totalPorts, devCount);
@@ -727,7 +752,7 @@ VOID UsbHubRawControlSelfTest(VOID)
         st = UsbHubRawControlToDevice(target,
                                       cases[i].bmRequest, cases[i].bRequest,
                                       cases[i].wValue, cases[i].wIndex,
-                                      buf, cases[i].wLength, cases[i].wLength, &got);
+                                      buf, cases[i].wLength, &got);
 
         if (NT_SUCCESS(st)) {
             LOG_INFO("  [%u] %-38s -> OK  got=%lu  data=%02X %02X %02X %02X",

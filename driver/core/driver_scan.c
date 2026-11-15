@@ -185,7 +185,7 @@ static BOOLEAN IsUsbBusType(_In_ PDEVICE_OBJECT pdo)
  *
  * 打印出来的数据可以验证「总线判定」是否比「名字匹配」更准确。
  */
-static VOID ProbeBusType(_In_ PDEVICE_OBJECT dev, _In_ PCWSTR driverName)
+static VOID ProbeBusType(_In_ PDEVICE_OBJECT dev, _In_ PCUNICODE_STRING driverName)
 {
     PDEVICE_OBJECT pdo;
     GUID           busType;
