@@ -304,50 +304,41 @@ static const char *nt_name(ULONG st) {
     }
 }
 
-static void cmd_fuzz_random(HANDLE h, ULONG iface, int nprobe) {
-    static const uint8_t bms[] = {0x80,0x81,0x82,0xA0,0xA1,0xA2,0xC0,0xC1,0xC2};
-    static const uint16_t wvs[] = {0x0000,0x0001,0x0100,0x0200,0x0300,0x0301,0x0302,0x0303,0xEE00,0xFFFF,0x1234};
-    static const uint16_t wis[] = {0x0000,0x0001,0x0002,0xFFFF};
-    unsigned char d[256];
-    for (int i = 0; i < nprobe; i++) {
-        uint8_t  bm = bms[rand() % 9];
-        uint8_t  rq = (uint8_t)(rand() & 0xFF);
-        uint16_t wv = wvs[rand() % 11];
-        uint16_t wi = wis[rand() % 4];
-        char sb[8], sr[8], swv[8], swi[8];
-        ULONG stat = 0;
-        sprintf(sb, "0x%02x", bm); sprintf(sr, "0x%02x", rq);
-        sprintf(swv, "0x%04x", wv); sprintf(swi, "0x%04x", wi);
-        int rt = raw_ctrl(h, iface, bm, rq, wv, wi, d, 256, &stat);
-        if (rt >= 0) emit(sb, sr, swv, swi, "", "ok", rt);
-        else         emit(sb, sr, swv, swi, "", nt_name(stat), 0);
-    }
-}
-
-static void cmd_diff(HANDLE h, ULONG iface) {
-    struct { const char *nm; uint16_t wi, wv, wl; } ms[] = {
-        {"wLength=0",0,0,0},{"wLength=1",0,0,1},{"wLength=255",0,0,255},
-        {"wLength=256",0,0,256},{"wLength=512",0,0,512},{"wLength=4096",0,0,4096},
-        {"wLength=65535",0,0,65535},{"wValue=FFFF",0,0xFFFF,256},{"wValue=7FFF",0,0x7FFF,256},
-        {"wValue=8000",0,0x8000,256},{"wIndex=FFFF",0xFFFF,0,256},{"wIndex=00FF",0x00FF,0,256},
-        {"wIndex=FF00",0xFF00,0,256}
+/*
+ * 行为探测 —— 对齐 kmboxdetect idscan 的 6 组只读 GET_DESCRIPTOR
+ *
+ * 之前这里是 cmd_fuzz_random(随机 IN 探针) + cmd_diff(3×256×13=9984 次
+ * 任意 bRequest)。9984 次控制传输打到一个正被 mouhid 占用的活鼠标上，
+ * 直接把它打到 PnP 移除 —— scan 完再 ifaces 就变成 0 接口。
+ *
+ * 所以改成和参考工具一致：6 组温和的只读描述符探测。这些请求
+ * 全部是 bRequest=6(GET_DESCRIPTOR)，不会改变设备状态，扫完设备还在。
+ */
+static void cmd_behavior(HANDLE h, ULONG iface) {
+    struct { const char *nm; uint8_t type, index; uint16_t wlen; } bs[] = {
+        {"DEVDESC_LEN0",     0x01, 0, 0},
+        {"DEV_QUAL",         0x06, 0, 0},
+        {"BOS",              0x0F, 0, 0},
+        {"CONFIG_IDX1",      0x02, 1, 0},
+        {"DEVDESC_PARTIAL8", 0x01, 0, 8},
+        {"DEVDESC_AFTER",    0x01, 0, 18},
     };
-    int nm = (int)(sizeof(ms) / sizeof(ms[0]));
-    static unsigned char d[256];
-    for (int bi = 0; bi < 3; bi++) {
-        uint8_t bm = (uint8_t[]){0x80, 0xA0, 0xC0}[bi];
-        for (int rq = 0; rq < 256; rq++)
-            for (int mi = 0; mi < nm; mi++) {
-                char bm_[8], r[8], wv[8], wi_[8], ex[32];
-                ULONG stat = 0;
-                sprintf(bm_, "0x%02x", bm); sprintf(r, "0x%02x", rq);
-                sprintf(wv, "0x%04x", ms[mi].wv); sprintf(wi_, "0x%04x", ms[mi].wi);
-                sprintf(ex, "s:%s", ms[mi].nm);
-                int rt = raw_ctrl(h, iface, bm, (uint8_t)rq, ms[mi].wv, ms[mi].wi,
-                                  d, ms[mi].wl, &stat);
-                if (rt >= 0) emit(bm_, r, wv, wi_, ex, "ok", rt);
-                else         emit(bm_, r, wv, wi_, ex, nt_name(stat), 0);
-            }
+    unsigned char d[256];
+    char wv[16], nm[32];
+
+    for (int i = 0; i < (int)(sizeof(bs) / sizeof(bs[0])); i++) {
+        ULONG stat = 0;
+        int rt;
+
+        sprintf(wv, "0x%04x", (uint16_t)((bs[i].type << 8) | bs[i].index));
+        sprintf(nm, "s:%s", bs[i].nm);
+
+        rt = raw_ctrl(h, iface, 0x80, 0x06,
+                      (uint16_t)((bs[i].type << 8) | bs[i].index),
+                      0, d, bs[i].wlen, &stat);
+
+        if (rt >= 0) emit("0x80", "0x06", wv, "0x0000", nm, "ok", rt);
+        else         emit("0x80", "0x06", wv, "0x0000", nm, nt_name(stat), 0);
     }
 }
 
@@ -358,8 +349,7 @@ static void scan_one(HANDLE h, const IFACE *f, int nprobe, int verbose) {
     if (g_buf) g_buf[0] = 0;
 
     collect_descriptors(h, f->Index, key);
-    cmd_fuzz_random(h, f->Index, nprobe);
-    cmd_diff(h, f->Index);
+    cmd_behavior(h, f->Index);
 
     g_mem = 0;
     size_t count = 0; char hash[65] = {0};
