@@ -42,13 +42,6 @@ static void emit_raw(const char *line) {
     g_buf[g_len] = 0;
 }
 
-static void emit(const char *bm, const char *rq, const char *wv, const char *wi,
-                 const char *ex, const char *st, long v) {
-    char line[256];
-    sprintf(line, "%s\t%s\t%s\t%s\t%s\t%s\t%ld\n", bm, rq, wv, wi, ex, st, v);
-    emit_raw(line);
-}
-
 static void emit_hex(const char *tag, const unsigned char *d, int n) {
     static char line[8192];
     int p = sprintf(line, "%s\thex\t", tag);
@@ -58,88 +51,19 @@ static void emit_hex(const char *tag, const unsigned char *d, int n) {
     emit_raw(line);
 }
 
-/* ================= 错误码粗分类 ================= */
-/* 仅保留 Win32 错误码名字；驱动侧状态改用 nt_name() */
-
 /* ================= 指纹计算 (排序/去重/哈希) ================= */
-typedef struct { char k[4][64]; int k4i; long k4n; char k4s[64]; char st[12]; long v; int vnone; } Ent;
-static int ent_cmp(const void *a, const void *b) {
-    const Ent *x = a, *y = b; int c;
-    for (int i = 0; i < 4; i++) { c = strcmp(x->k[i], y->k[i]); if (c) return c; }
-    if (x->k4i && y->k4i) return (x->k4n > y->k4n) - (x->k4n < y->k4n);
-    if (!x->k4i && !y->k4i) return strcmp(x->k4s, y->k4s);
-    return x->k4i ? -1 : 1;
-}
-static void ap(char **b, size_t *c, size_t *l, const char *s) {
-    size_t n = strlen(s);
-    if (*l + n + 1 > *c) { while (*l + n + 1 > *c) *c = *c ? *c * 2 : 65536; *b = realloc(*b, *c); }
-    memcpy(*b + *l, s, n); *l += n; (*b)[*l] = 0;
-}
-static void api(char **b, size_t *c, size_t *l, long v) { char t[32]; sprintf(t, "%ld", v); ap(b, c, l, t); }
-static char *build_repr(Ent *e, size_t n) {
-    char *b = 0; size_t c = 0, l = 0;
-    ap(&b, &c, &l, "[");
-    for (size_t i = 0; i < n; i++) {
-        if (i) ap(&b, &c, &l, ", ");
-        ap(&b, &c, &l, "((");
-        for (int j = 0; j < 4; j++) {
-            if (j) ap(&b, &c, &l, ", ");
-            ap(&b, &c, &l, "'"); ap(&b, &c, &l, e[i].k[j]); ap(&b, &c, &l, "'");
-        }
-        ap(&b, &c, &l, ", ");
-        if (e[i].k4i) api(&b, &c, &l, e[i].k4n);
-        else { ap(&b, &c, &l, "'"); ap(&b, &c, &l, e[i].k4s); ap(&b, &c, &l, "'"); }
-        ap(&b, &c, &l, "), ('");
-        ap(&b, &c, &l, e[i].st);
-        ap(&b, &c, &l, "', ");
-        if (e[i].vnone) ap(&b, &c, &l, "None"); else api(&b, &c, &l, e[i].v);
-        ap(&b, &c, &l, "))");
-    }
-    ap(&b, &c, &l, "]");
-    return b;
-}
-static int parse_line(char *line, Ent *cur) {
-    char *f[8]; int nf = 0; char *p = line; f[nf++] = p;
-    for (; *p; p++) {
-        if (*p == '\t') { *p = 0; f[nf++] = p + 1; if (nf >= 8) break; }
-        if (*p == '\n' || *p == '\r') { *p = 0; break; }
-    }
-    if (nf < 6) return 0;
-    memset(cur, 0, sizeof(Ent));
-    strncpy(cur->k[0], f[0], 63); strncpy(cur->k[1], f[1], 63);
-    strncpy(cur->k[2], f[2], 63); strncpy(cur->k[3], f[3], 63);
-    if (f[4][0] == 'i' && f[4][1] == ':') { cur->k4i = 1; cur->k4n = atol(f[4] + 2); }
-    else if (f[4][0] == 's' && f[4][1] == ':') strncpy(cur->k4s, f[4] + 2, 63);
-    else strncpy(cur->k4s, f[4], 63);
-    strncpy(cur->st, f[5], 11);
-    if (nf >= 7 && strcmp(f[6], "None") == 0) { cur->vnone = 1; cur->v = 0; }
-    else cur->v = nf >= 7 ? atol(f[6]) : 0;
-    return 1;
-}
+/* ================= 指纹计算 =================
+ * 转录是确定性的（固定顺序 emit_field / emit_hex），没有随机探针，
+ * 所以直接对原文做 SHA256，不需要旧的排序/去重/结构化解析。
+ */
 static void compute_hash(const char *text, size_t *out_count, char hash_out[65]) {
-    size_t cap = 262144, n = 0;
-    Ent *e = (Ent *)malloc(cap * sizeof(Ent));
+    size_t lines = 0;
     const char *p = text;
-    while (p && *p) {
-        const char *eol = strchr(p, '\n');
-        size_t len = eol ? (size_t)(eol - p) : strlen(p);
-        if (len > 0) {
-            char *line = (char *)malloc(len + 1);
-            memcpy(line, p, len); line[len] = 0;
-            if (n >= cap) { cap *= 2; e = (Ent *)realloc(e, cap * sizeof(Ent)); }
-            if (parse_line(line, &e[n])) n++;
-            free(line);
-        }
-        if (!eol) break;
-        p = eol + 1;
-    }
-    qsort(e, n, sizeof(Ent), ent_cmp);
-    size_t m = 0;
-    for (size_t i = 0; i < n; i++) { if (i + 1 < n && ent_cmp(&e[i], &e[i + 1]) == 0) continue; e[m++] = e[i]; }
-    char *repr = build_repr(e, m);
-    sha256_hex((const uint8_t *)repr, strlen(repr), hash_out);
-    if (out_count) *out_count = m;
-    free(repr); free(e);
+
+    while (p && *p) { if (*p == '\n') lines++; p++; }
+
+    sha256_hex((const uint8_t *)text, strlen(text), hash_out);
+    if (out_count) *out_count = lines;
 }
 
 /* ================= 驱动交互 ================= */
@@ -201,12 +125,6 @@ static int raw_ctrl(HANDLE h, ULONG iface, uint8_t bm, uint8_t rq, uint16_t wv, 
     return (int)req.Returned;
 }
 
-static int read_desc(HANDLE h, ULONG iface, uint8_t type, uint8_t index, uint16_t wIndex,
-                     unsigned char *buf, uint16_t len) {
-    return raw_ctrl(h, iface, 0x80, 0x06, (uint16_t)((type << 8) | index),
-                    wIndex, buf, len, NULL);
-}
-
 /* ================= GUID 接口枚举 ================= */
 typedef struct {
     ULONG Index;
@@ -245,130 +163,109 @@ static BOOL block_dev(HANDLE h, ULONG idx, BOOL on) {
     return DeviceIoControl(h, IOCTL_USB_BLOCK_DEVICE, &r, sizeof(r), NULL, 0, &ret, NULL);
 }
 
-/* ================= 描述符采集 ================= */
-static void collect_descriptors(HANDLE h, ULONG idx, char key_out[64]) {
-    unsigned char d[512];
-    memset(d, 0, sizeof(d));
-    int n = read_desc(h, idx, 0x01, 0, 0, d, 18);
-    if (n >= 18 && d[0] == 18) {
-        uint16_t bcdUSB = (uint16_t)(d[2] | (d[3] << 8));
-        uint16_t vid = (uint16_t)(d[8] | (d[9] << 8));
-        uint16_t pid = (uint16_t)(d[10] | (d[11] << 8));
-        uint16_t rev = (uint16_t)(d[12] | (d[13] << 8));
-        sprintf(key_out, "VID_%04X&PID_%04X&REV_%04X&USB_%04X", vid, pid, rev, bcdUSB);
-        emit_hex("DEV_DESC", d, n);
-    } else {
-        strcpy(key_out, "VID_UNKNOWN");
-        emit("DEV_DESC", "", "", "", "", "err", 0);
-    }
-    memset(d, 0, sizeof(d));
-    n = read_desc(h, idx, 0x02, 0, 0, d, 9);
-    if (n >= 9 && d[0] == 9) {
-        uint16_t total = (uint16_t)(d[2] | (d[3] << 8));
-        emit_hex("CFG_DESC9", d, n);
-        if (total >= 9 && total <= sizeof(d)) {
-            memset(d, 0, sizeof(d));
-            int n2 = read_desc(h, idx, 0x02, 0, 0, d, (uint16_t)total);
-            if (n2 > 0) emit_hex("CFG_DESC_FULL", d, n2);
-        }
-    } else emit("CFG_DESC9", "", "", "", "", "err", 0);
-
-    memset(d, 0, sizeof(d));
-    n = read_desc(h, idx, 0x22, 0, 0, d, 64);
-    if (n > 0) emit_hex("REPORT_DESC", d, n);
-    else emit("REPORT_DESC", "", "", "", "", "err", 0);
-
-    memset(d, 0, sizeof(d));
-    n = read_desc(h, idx, 0x03, 0, 0x0409, d, 4);
-    if (n >= 4) emit_hex("STR_LANGID", d, n);
-    for (int i = 1; i <= 3; i++) {
-        memset(d, 0, sizeof(d));
-        n = read_desc(h, idx, 0x03, (uint8_t)i, 0x0409, d, 255);
-        if (n > 0) { char tag[32]; sprintf(tag, "STR_IDX%d", i); emit_hex(tag, d, n); }
-    }
+/* ================= 扫描（走 IOCTL_USB_FULL_ENUM，等价 kmboxdetect idscan）================= */
+static void emit_field(const char *k, const char *v) {
+    char line[1024];
+    sprintf(line, "%s\t%s\n", k, v);
+    emit_raw(line);
 }
 
-/* ================= 探针 ================= */
-
-/* 把驱动返回的 NTSTATUS 压成短标签，作为指纹里的一维 */
-static const char *nt_name(ULONG st) {
-    switch (st) {
-    case 0x00000000: return "ok";
-    case 0xFFFFFFFF: return "ioctl_fail";
-    case 0xC0000001: return "STALL";        /* STATUS_UNSUCCESSFUL */
-    case 0xC0000010: return "INVALID_REQ";  /* STATUS_INVALID_DEVICE_REQUEST */
-    case 0xC0000023: return "BUF_SMALL";    /* STATUS_BUFFER_TOO_SMALL */
-    case 0xC00000BB: return "NOT_SUPPORTED";
-    case 0xC0000004: return "INVALID_INFO";
-    default:         return "other";
-    }
+static void wstr_emit(const char *key, const WCHAR *w) {
+    char u[512];
+    if (!w || !w[0]) return;
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, u, sizeof(u), NULL, NULL);
+    emit_field(key, u);
 }
 
-/*
- * 行为探测 —— 对齐 kmboxdetect idscan 的 6 组只读 GET_DESCRIPTOR
- *
- * 之前这里是 cmd_fuzz_random(随机 IN 探针) + cmd_diff(3×256×13=9984 次
- * 任意 bRequest)。9984 次控制传输打到一个正被 mouhid 占用的活鼠标上，
- * 直接把它打到 PnP 移除 —— scan 完再 ifaces 就变成 0 接口。
- *
- * 所以改成和参考工具一致：6 组温和的只读描述符探测。这些请求
- * 全部是 bRequest=6(GET_DESCRIPTOR)，不会改变设备状态，扫完设备还在。
- */
-static void cmd_behavior(HANDLE h, ULONG iface) {
-    struct { const char *nm; uint8_t type, index; uint16_t wlen; } bs[] = {
-        {"DEVDESC_LEN0",     0x01, 0, 0},
-        {"DEV_QUAL",         0x06, 0, 0},
-        {"BOS",              0x0F, 0, 0},
-        {"CONFIG_IDX1",      0x02, 1, 0},
-        {"DEVDESC_PARTIAL8", 0x01, 0, 8},
-        {"DEVDESC_AFTER",    0x01, 0, 18},
-    };
-    unsigned char d[256];
-    char wv[16], nm[32];
+/* 对一台 Hub 设备做身份指纹 —— 数据全来自驱动 IOCTL_USB_FULL_ENUM */
+static void scan_full_one(HANDLE h, const USB_DEV_UM *d, ULONG devIdx, int verbose) {
+    char key[64], buf[256];
+    ULONG k;
 
-    for (int i = 0; i < (int)(sizeof(bs) / sizeof(bs[0])); i++) {
-        ULONG stat = 0;
-        int rt;
-
-        sprintf(wv, "0x%04x", (uint16_t)((bs[i].type << 8) | bs[i].index));
-        sprintf(nm, "s:%s", bs[i].nm);
-
-        rt = raw_ctrl(h, iface, 0x80, 0x06,
-                      (uint16_t)((bs[i].type << 8) | bs[i].index),
-                      0, d, bs[i].wlen, &stat);
-
-        if (rt >= 0) emit("0x80", "0x06", wv, "0x0000", nm, "ok", rt);
-        else         emit("0x80", "0x06", wv, "0x0000", nm, nt_name(stat), 0);
-    }
-}
-
-/* ================= 扫描 ================= */
-static void scan_one(HANDLE h, const IFACE *f, int nprobe, int verbose) {
-    char key[64] = {0};
     g_mem = 1; g_len = 0;
     if (g_buf) g_buf[0] = 0;
 
-    collect_descriptors(h, f->Index, key);
-    cmd_behavior(h, f->Index);
+    sprintf(key, "VID_%04X&PID_%04X&REV_%04X&USB_%04X",
+            d->Vid, d->Pid, d->BcdDevice, d->BcdUSB);
+
+    sprintf(buf, "hub=%lu port=%lu speed=%u", d->HubIndex, d->PortNumber, d->Speed);
+    emit_field("LOC", buf);
+
+    emit_field("DEV_DESC", key);
+
+    sprintf(buf, "class=%02X/%02X/%02X cfg#%u ifaces=%u",
+            d->DeviceClass, d->DeviceSubClass, d->DeviceProtocol,
+            d->ConfigValue, d->IfaceCount);
+    emit_field("CFG", buf);
+
+    wstr_emit("MFG",     d->Manufacturer);
+    wstr_emit("PRODUCT", d->Product);
+    wstr_emit("SERIAL",  d->Serial);
+
+    if (d->HasQualifier) {
+        sprintf(buf, "bcdUSB=%04X class=%02X/%02X/%02X maxpkt0=%u cfgs=%u",
+                d->QualBcdUSB, d->QualClass, d->QualSubClass, d->QualProtocol,
+                d->QualMaxPacket0, d->QualNumConfigs);
+        emit_field("QUAL", buf);
+    }
+    if (d->HasBos) {
+        sprintf(buf, "total=%u caps=%u", d->BosTotalLen, d->BosCapCount);
+        emit_field("BOS", buf);
+    }
+
+    for (k = 0; k < d->IfaceCount && k < USB_IFACE_MAX_UM; k++) {
+        const USB_IFACE_UM *ii = &d->Ifaces[k];
+
+        sprintf(buf, "iface%u class=%02X/%02X/%02X eps=%u",
+                ii->Number, ii->Class, ii->SubClass, ii->Protocol, ii->Endpoints);
+        emit_field("IFACE", buf);
+
+        if (ii->HidDescLen) {
+            sprintf(buf, "bcdHID=%04X country=%u numDesc=%u phys=%u",
+                    ii->HidBcdHID, ii->HidCountry, ii->HidNumDesc,
+                    ii->HasPhysDesc ? ii->PhysDescLen : 0);
+            emit_field("HID", buf);
+        }
+
+        if (ii->HasReport) {
+            USB_REPORT_REQ rq;
+            USB_REPORT_RSP rsp;
+            DWORD ret = 0;
+
+            memset(&rq, 0, sizeof(rq));
+            memset(&rsp, 0, sizeof(rsp));
+            rq.DevIndex   = devIdx;
+            rq.IfaceIndex = k;
+
+            if (DeviceIoControl(h, IOCTL_USB_REPORT_DESC, &rq, sizeof(rq),
+                                &rsp, sizeof(rsp), &ret, NULL) && rsp.Length > 0)
+                emit_hex("REPORT_DESC", rsp.Data, rsp.Length);
+        }
+    }
 
     g_mem = 0;
     size_t count = 0; char hash[65] = {0};
     compute_hash(g_buf, &count, hash);
 
-    printf("  [%lu] VID_%04X&PID_%04X&REV_%04X&USB_%04X  class=%02X/%02X/%02X\n",
-           f->Index, f->Vid, f->Pid, f->Rev, f->BcdUSB, f->Cls, f->Sub, f->Proto);
-    printf("        基线键: %s\n", key[0] ? key : "(unknown)");
+    printf("  [%lu] %s  %s\n", devIdx, key, d->Suspicious ? "  <<< 可疑复合" : "");
+    printf("        端口: hub=%lu port=%lu  speed=%u\n", d->HubIndex, d->PortNumber, d->Speed);
+    if (d->Manufacturer[0] || d->Product[0]) {
+        char m[256], p[256];
+        WideCharToMultiByte(CP_UTF8, 0, d->Manufacturer, -1, m, sizeof(m), NULL, NULL);
+        WideCharToMultiByte(CP_UTF8, 0, d->Product, -1, p, sizeof(p), NULL, NULL);
+        printf("        名称: %s %s\n", m, p);
+    }
     printf("        条目数: %zu\n", count);
     printf("        指纹:   %s\n", hash);
     if (verbose) {
         printf("        ---- 转录预览 ----\n");
         int lines = 0;
-        for (char *p = g_buf; p && *p && lines < 10; lines++) {
-            char *nl = strchr(p, '\n');
+        for (char *p2 = g_buf; p2 && *p2 && lines < 10; lines++) {
+            char *nl = strchr(p2, '\n');
             if (nl) *nl = 0;
-            printf("        %s\n", p);
+            printf("        %s\n", p2);
             if (!nl) break;
-            p = nl + 1;
+            p2 = nl + 1;
         }
     }
 }
@@ -490,18 +387,29 @@ int main(int argc, char **argv) {
         return nf > 0 ? 0 : 2;
     }
 
-    /* ---- scan: 固件指纹扫描（走 IOCTL_USB_RAW_CONTROL）---- */
+    /* ---- scan: 全量枚举 + 身份指纹（等价 kmboxdetect idscan）---- */
     if (argc >= 2 && !strcmp(argv[1], "scan")) {
-        static IFACE f[16];
-        int nf = probe_ifaces(h, f, 16);
+        static USB_FULL_LIST_UM full;
+        DWORD ret = 0;
 
-        printf("========== 固件指纹扫描 (probes=%d, ifaces=%d) ==========\n", nprobe, nf);
-        if (nf == 0) {
-            printf("  (没有可用接口 —— 先跑 usb_client ifaces 看驱动通道)\n");
+        if (!DeviceIoControl(h, IOCTL_USB_FULL_ENUM, NULL, 0,
+                             &full, sizeof(full), &ret, NULL)) {
+            printf("FULL_ENUM ioctl 失败 (err=%lu)\n", GetLastError());
+            CloseHandle(h);
+            return 1;
+        }
+
+        printf("========== 全量枚举指纹 (hub=%lu, 设备=%lu, last=0x%08lX) ==========\n",
+               full.HubCount, full.Count, full.LastStatus);
+        if (full.Count == 0) {
+            printf("  (驱动没枚举到设备 —— 看 log 里的 UsbHubEnumAll)\n");
             CloseHandle(h);
             return 2;
         }
-        for (int i = 0; i < nf; i++) scan_one(h, &f[i], nprobe, verbose);
+
+        for (ULONG i = 0; i < full.Count && i < USB_FULL_MAX_UM; i++)
+            scan_full_one(h, &full.Devs[i], i, verbose);
+
         CloseHandle(h);
         return 0;
     }
