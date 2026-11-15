@@ -182,13 +182,16 @@ VOID UsbUrbControlSelfTest(VOID);
 /*
  * UsbUrbControlTransfer - 任意控制传输（内核版 libusb_control_transfer）
  *
- * DevIndex : GUID_DEVINTERFACE_USB_DEVICE 枚举列表里的下标
- * SetupPacket 全部由调用方指定
+ * DevIndex    : GUID_DEVINTERFACE_USB_DEVICE 枚举列表里的下标
+ * BufLen      : 实际数据缓冲区字节数（<= USB_REPORT_DESC_MAX）
+ * DeclaredLen : SetupPacket 里声明的 wLength，0 表示与 BufLen 相同
+ *               —— 两者分开是为了忠实复现 wLength=65535 这类越界探测
  * ★ PASSIVE_LEVEL
  */
 NTSTATUS UsbUrbControlTransfer(_In_ ULONG DevIndex,
                                _In_ UCHAR bmRequest, _In_ UCHAR bRequest,
                                _In_ USHORT wValue, _In_ USHORT wIndex,
-                               _Inout_updates_bytes_(Len) PVOID Data,
-                               _In_ USHORT Len,
+                               _Inout_updates_bytes_opt_(BufLen) PVOID Data,
+                               _In_ USHORT BufLen,
+                               _In_ USHORT DeclaredLen,
                                _Out_ PULONG Got);

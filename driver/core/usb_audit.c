@@ -1195,7 +1195,8 @@ static NTSTATUS DoRawControl(PVOID buffer, ULONG inLen, ULONG outLen, PULONG inf
 {
     USB_RAW_CTRL_REQ *r;
     ULONG             got = 0;
-    ULONG             len;
+    ULONG             buflen;
+    USHORT            declared;
     NTSTATUS          st;
 
     if (buffer == NULL) return STATUS_INVALID_PARAMETER;
@@ -1205,12 +1206,18 @@ static NTSTATUS DoRawControl(PVOID buffer, ULONG inLen, ULONG outLen, PULONG inf
 
     r = (USB_RAW_CTRL_REQ *)buffer;
 
-    len = r->wLength;
-    if (len == 0 || len > USB_RAW_MAX_UM) return STATUS_INVALID_PARAMETER;
+    /*
+     * 声明长度与实际缓冲区分离：
+     *   wLength 原样写进 SetupPacket（fuzz 要探 wLength=65535 这种越界值）
+     *   实际缓冲区最大 USB_RAW_MAX_UM 字节
+     */
+    declared = r->wLength;
+    buflen   = (declared > USB_RAW_MAX_UM) ? USB_RAW_MAX_UM : declared;
 
     st = UsbUrbControlTransfer(r->DevIndex, r->bmRequestType, r->bRequest,
-                               r->wValue, r->wIndex, r->Data,
-                               (USHORT)len, &got);
+                               r->wValue, r->wIndex,
+                               buflen ? r->Data : NULL,
+                               (USHORT)buflen, declared, &got);
 
     r->Status   = (ULONG)st;
     r->Returned = got;

@@ -727,7 +727,7 @@ VOID UsbHubRawControlSelfTest(VOID)
         st = UsbHubRawControlToDevice(target,
                                       cases[i].bmRequest, cases[i].bRequest,
                                       cases[i].wValue, cases[i].wIndex,
-                                      buf, cases[i].wLength, &got);
+                                      buf, cases[i].wLength, cases[i].wLength, &got);
 
         if (NT_SUCCESS(st)) {
             LOG_INFO("  [%u] %-38s -> OK  got=%lu  data=%02X %02X %02X %02X",
@@ -786,16 +786,21 @@ static NTSTATUS SendUrbToDevice(PDEVICE_OBJECT Dev, PVOID Urb, ULONG UrbLen)
 NTSTATUS UsbUrbControlTransfer(ULONG DevIndex,
                                UCHAR bmRequest, UCHAR bRequest,
                                USHORT wValue, USHORT wIndex,
-                               PVOID Data, USHORT Len, PULONG Got)
+                               PVOID Data, USHORT BufLen, USHORT DeclaredLen,
+                               PULONG Got)
 {
     PWSTR    links = NULL;
     NTSTATUS st;
     ULONG    idx = 0;
     BOOLEAN  done = FALSE;
+    USHORT   declared;
 
     if (Got) *Got = 0;
-    if (Data == NULL || Len == 0) return STATUS_INVALID_PARAMETER;
+    /* BufLen==0 合法：无数据阶段的控制传输（fuzz 会把 wLength=0 当探测点） */
+    if (BufLen != 0 && Data == NULL) return STATUS_INVALID_PARAMETER;
     if (KeGetCurrentIrql() != PASSIVE_LEVEL) return STATUS_INVALID_DEVICE_STATE;
+
+    declared = DeclaredLen ? DeclaredLen : BufLen;
 
     st = IoGetDeviceInterfaces(&GUID_DEVINTERFACE_USB_DEVICE, NULL, 0, &links);
     if (!NT_SUCCESS(st) || links == NULL) return st;
@@ -837,7 +842,7 @@ NTSTATUS UsbUrbControlTransfer(ULONG DevIndex,
                                        | USBD_DEFAULT_PIPE_TRANSFER
                                        | USBD_SHORT_TRANSFER_OK;
 
-                    urb->TransferBufferLength = Len;
+                    urb->TransferBufferLength = BufLen;
                     urb->TransferBuffer       = Data;
                     urb->TransferBufferMDL    = NULL;
                     urb->UrbLink              = NULL;
@@ -847,8 +852,8 @@ NTSTATUS UsbUrbControlTransfer(ULONG DevIndex,
                     urb->SetupPacket[3]       = (UCHAR)(wValue >> 8);
                     urb->SetupPacket[4]       = (UCHAR)(wIndex & 0xFF);
                     urb->SetupPacket[5]       = (UCHAR)(wIndex >> 8);
-                    urb->SetupPacket[6]       = (UCHAR)(Len & 0xFF);
-                    urb->SetupPacket[7]       = (UCHAR)(Len >> 8);
+                    urb->SetupPacket[6]       = (UCHAR)(declared & 0xFF);
+                    urb->SetupPacket[7]       = (UCHAR)(declared >> 8);
 
                     st = SendUrbToDevice(dev, urb, urbLen);
 
@@ -1043,7 +1048,7 @@ VOID UsbUrbControlSelfTest(VOID)
     for (ULONG i = 0; i < 4; i++) {
         RtlZeroMemory(buf, sizeof(buf));
         got = 0;
-        st = UsbUrbControlTransfer(i, 0x80, 6, 0x0100, 0, buf, 18, &got);
+        st = UsbUrbControlTransfer(i, 0x80, 6, 0x0100, 0, buf, 18, 18, &got);
         LOG_INFO("  probe iface[%lu]: st=%08X got=%lu", i, st, got);
         if (NT_SUCCESS(st) && got >= 18) { probeIdx = i; break; }
     }
@@ -1062,7 +1067,7 @@ VOID UsbUrbControlSelfTest(VOID)
         st = UsbUrbControlTransfer(probeIdx,
                                    cases[i].bmRequest, cases[i].bRequest,
                                    cases[i].wValue, cases[i].wIndex,
-                                   buf, cases[i].wLength, &got);
+                                   buf, cases[i].wLength, cases[i].wLength, &got);
 
         if (NT_SUCCESS(st)) {
             LOG_INFO("  [%u] %-38s -> OK  got=%lu  data=%02X %02X %02X %02X",

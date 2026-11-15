@@ -59,17 +59,7 @@ static void emit_hex(const char *tag, const unsigned char *d, int n) {
 }
 
 /* ================= 错误码粗分类 ================= */
-static const char *classify_error(DWORD err) {
-    switch (err) {
-    case ERROR_GEN_FAILURE:          return "GEN_FAIL";
-    case ERROR_INVALID_PARAMETER:    return "INVALID_PARAM";
-    case ERROR_SEM_TIMEOUT:          return "TIMEOUT";
-    case ERROR_DEVICE_NOT_CONNECTED: return "DISCONNECTED";
-    case ERROR_NOT_ENOUGH_MEMORY:    return "NOMEM";
-    case ERROR_OPERATION_ABORTED:    return "ABORTED";
-    default:                         return "OTHER";
-    }
-}
+/* 仅保留 Win32 错误码名字；驱动侧状态改用 nt_name() */
 
 /* ================= 指纹计算 (排序/去重/哈希) ================= */
 typedef struct { char k[4][64]; int k4i; long k4n; char k4s[64]; char st[12]; long v; int vnone; } Ent;
@@ -166,35 +156,84 @@ static int enum_devices(HANDLE h, USB_DEV_LIST *out) {
     return (int)out->Count;
 }
 
-/* 对指定 devIndex 发控制传输: 成功返回字节数, 失败 -1 */
-static int ctrl(HANDLE h, ULONG devIndex, uint8_t bm, uint8_t rq, uint16_t wv, uint16_t wi,
-                unsigned char *d, uint16_t n) {
-    ULONG size = sizeof(USB_CTRL_REQ) + n;
-    USB_CTRL_REQ *req = (USB_CTRL_REQ *)calloc(1, size);
-    req->DevIndex = devIndex;
-    req->bmRequestType = bm;
-    req->bRequest = rq;
-    req->wValue = wv;
-    req->wIndex = wi;
-    req->wLength = n;
-    if (n > 0 && !(bm & 0x80)) memcpy((PUCHAR)req + sizeof(USB_CTRL_REQ), d, n);
+/* ================= 任意控制传输 (IOCTL_USB_RAW_CONTROL) =================
+ * iface 是 GUID_DEVINTERFACE_USB_DEVICE 枚举列表里的下标（见 ifaces 命令）。
+ *
+ * 返回：>=0 实际字节数（成功；设备 STALL 时返回 -1 但 status_out 有效）
+ *       -1  IOCTL 本身失败 或 设备回 STALL（看 status_out 区分）
+ *
+ * wLength 和缓冲区分离：wLength 可以声明 65535 这种越界值，
+ * 实际只给 256 字节缓冲 —— 和 kmboxdetect.exe 的 diff 探测一致。
+ */
+static int raw_ctrl(HANDLE h, ULONG iface, uint8_t bm, uint8_t rq, uint16_t wv, uint16_t wi,
+                    unsigned char *d, uint16_t wlen, ULONG *status_out) {
+    static USB_RAW_CTRL_REQ req;
     DWORD ret = 0;
-    BOOL ok = DeviceIoControl(h, IOCTL_USB_CONTROL_TRANSFER, req, size, req, size, &ret, NULL);
-    int result;
-    if (ok) {
-        result = (int)req->bytesReturned;
-        if (n > 0 && (bm & 0x80) && d)
-            memcpy(d, (PUCHAR)req + sizeof(USB_CTRL_REQ), req->bytesReturned);
-    } else {
-        result = -1;
+
+    memset(&req, 0, sizeof(req));
+    req.DevIndex      = iface;
+    req.bmRequestType = bm;
+    req.bRequest      = rq;
+    req.wValue        = wv;
+    req.wIndex        = wi;
+    req.wLength       = wlen;
+
+    if (wlen > 0 && !(bm & 0x80) && d) {
+        ULONG n = wlen > USB_RAW_MAX_UM ? USB_RAW_MAX_UM : wlen;
+        memcpy(req.Data, d, n);
     }
-    free(req);
-    return result;
+
+    if (!DeviceIoControl(h, IOCTL_USB_RAW_CONTROL, &req, sizeof(req),
+                         &req, sizeof(req), &ret, NULL)) {
+        if (status_out) *status_out = 0xFFFFFFFF;
+        return -1;
+    }
+    if (status_out) *status_out = req.Status;
+
+    /* 驱动即使设备 STALL 也返回 STATUS_SUCCESS，用它内部的 Status 判定 */
+    if (req.Status != 0) return -1;
+
+    if (wlen > 0 && (bm & 0x80) && d) {
+        ULONG n = req.Returned > USB_RAW_MAX_UM ? USB_RAW_MAX_UM : req.Returned;
+        if (n > wlen) n = wlen;
+        memcpy(d, req.Data, n);
+    }
+    return (int)req.Returned;
 }
 
-static int read_desc(HANDLE h, ULONG idx, uint8_t type, uint8_t index, uint16_t wIndex,
+static int read_desc(HANDLE h, ULONG iface, uint8_t type, uint8_t index, uint16_t wIndex,
                      unsigned char *buf, uint16_t len) {
-    return ctrl(h, idx, 0x80, 0x06, (uint16_t)((type << 8) | index), wIndex, buf, len);
+    return raw_ctrl(h, iface, 0x80, 0x06, (uint16_t)((type << 8) | index),
+                    wIndex, buf, len, NULL);
+}
+
+/* ================= GUID 接口枚举 ================= */
+typedef struct {
+    ULONG Index;
+    uint16_t Vid, Pid, Rev, BcdUSB;
+    unsigned char Cls, Sub, Proto;
+} IFACE;
+
+/* 逐个下标试 GET_DESCRIPTOR(Device)，能返回合法 18 字节的就算一个可用接口 */
+static int probe_ifaces(HANDLE h, IFACE *out, int max) {
+    int n = 0;
+    for (ULONG i = 0; i < 32 && n < max; i++) {
+        unsigned char d[18];
+        ULONG st = 0;
+        memset(d, 0, sizeof(d));
+        int r = raw_ctrl(h, i, 0x80, 0x06, 0x0100, 0, d, 18, &st);
+        if (r < 18 || d[0] != 18 || d[1] != 0x01) continue;
+        out[n].Index  = i;
+        out[n].BcdUSB = (uint16_t)(d[2] | (d[3] << 8));
+        out[n].Cls    = d[4];
+        out[n].Sub    = d[5];
+        out[n].Proto  = d[6];
+        out[n].Vid    = (uint16_t)(d[8] | (d[9] << 8));
+        out[n].Pid    = (uint16_t)(d[10] | (d[11] << 8));
+        out[n].Rev    = (uint16_t)(d[12] | (d[13] << 8));
+        n++;
+    }
+    return n;
 }
 
 static BOOL block_dev(HANDLE h, ULONG idx, BOOL on) {
@@ -250,7 +289,22 @@ static void collect_descriptors(HANDLE h, ULONG idx, char key_out[64]) {
 }
 
 /* ================= 探针 ================= */
-static void cmd_fuzz_random(HANDLE h, ULONG idx, int nprobe) {
+
+/* 把驱动返回的 NTSTATUS 压成短标签，作为指纹里的一维 */
+static const char *nt_name(ULONG st) {
+    switch (st) {
+    case 0x00000000: return "ok";
+    case 0xFFFFFFFF: return "ioctl_fail";
+    case 0xC0000001: return "STALL";        /* STATUS_UNSUCCESSFUL */
+    case 0xC0000010: return "INVALID_REQ";  /* STATUS_INVALID_DEVICE_REQUEST */
+    case 0xC0000023: return "BUF_SMALL";    /* STATUS_BUFFER_TOO_SMALL */
+    case 0xC00000BB: return "NOT_SUPPORTED";
+    case 0xC0000004: return "INVALID_INFO";
+    default:         return "other";
+    }
+}
+
+static void cmd_fuzz_random(HANDLE h, ULONG iface, int nprobe) {
     static const uint8_t bms[] = {0x80,0x81,0x82,0xA0,0xA1,0xA2,0xC0,0xC1,0xC2};
     static const uint16_t wvs[] = {0x0000,0x0001,0x0100,0x0200,0x0300,0x0301,0x0302,0x0303,0xEE00,0xFFFF,0x1234};
     static const uint16_t wis[] = {0x0000,0x0001,0x0002,0xFFFF};
@@ -261,15 +315,16 @@ static void cmd_fuzz_random(HANDLE h, ULONG idx, int nprobe) {
         uint16_t wv = wvs[rand() % 11];
         uint16_t wi = wis[rand() % 4];
         char sb[8], sr[8], swv[8], swi[8];
+        ULONG stat = 0;
         sprintf(sb, "0x%02x", bm); sprintf(sr, "0x%02x", rq);
         sprintf(swv, "0x%04x", wv); sprintf(swi, "0x%04x", wi);
-        int rt = ctrl(h, idx, bm, rq, wv, wi, d, 256);
+        int rt = raw_ctrl(h, iface, bm, rq, wv, wi, d, 256, &stat);
         if (rt >= 0) emit(sb, sr, swv, swi, "", "ok", rt);
-        else         emit(sb, sr, swv, swi, "", classify_error(GetLastError()), 0);
+        else         emit(sb, sr, swv, swi, "", nt_name(stat), 0);
     }
 }
 
-static void cmd_diff(HANDLE h, ULONG idx) {
+static void cmd_diff(HANDLE h, ULONG iface) {
     struct { const char *nm; uint16_t wi, wv, wl; } ms[] = {
         {"wLength=0",0,0,0},{"wLength=1",0,0,1},{"wLength=255",0,0,255},
         {"wLength=256",0,0,256},{"wLength=512",0,0,512},{"wLength=4096",0,0,4096},
@@ -278,37 +333,40 @@ static void cmd_diff(HANDLE h, ULONG idx) {
         {"wIndex=FF00",0xFF00,0,256}
     };
     int nm = (int)(sizeof(ms) / sizeof(ms[0]));
-    static unsigned char d[65536];
+    static unsigned char d[256];
     for (int bi = 0; bi < 3; bi++) {
         uint8_t bm = (uint8_t[]){0x80, 0xA0, 0xC0}[bi];
         for (int rq = 0; rq < 256; rq++)
             for (int mi = 0; mi < nm; mi++) {
                 char bm_[8], r[8], wv[8], wi_[8], ex[32];
+                ULONG stat = 0;
                 sprintf(bm_, "0x%02x", bm); sprintf(r, "0x%02x", rq);
                 sprintf(wv, "0x%04x", ms[mi].wv); sprintf(wi_, "0x%04x", ms[mi].wi);
                 sprintf(ex, "s:%s", ms[mi].nm);
-                int rt = ctrl(h, idx, bm, (uint8_t)rq, ms[mi].wv, ms[mi].wi, d, ms[mi].wl);
+                int rt = raw_ctrl(h, iface, bm, (uint8_t)rq, ms[mi].wv, ms[mi].wi,
+                                  d, ms[mi].wl, &stat);
                 if (rt >= 0) emit(bm_, r, wv, wi_, ex, "ok", rt);
-                else         emit(bm_, r, wv, wi_, ex, classify_error(GetLastError()), 0);
+                else         emit(bm_, r, wv, wi_, ex, nt_name(stat), 0);
             }
     }
 }
 
 /* ================= 扫描 ================= */
-static void scan_one(HANDLE h, const USB_DEV_INFO *info, int nprobe, int verbose) {
+static void scan_one(HANDLE h, const IFACE *f, int nprobe, int verbose) {
     char key[64] = {0};
     g_mem = 1; g_len = 0;
     if (g_buf) g_buf[0] = 0;
 
-    collect_descriptors(h, info->Index, key);
-    cmd_fuzz_random(h, info->Index, nprobe);
-    cmd_diff(h, info->Index);
+    collect_descriptors(h, f->Index, key);
+    cmd_fuzz_random(h, f->Index, nprobe);
+    cmd_diff(h, f->Index);
 
     g_mem = 0;
     size_t count = 0; char hash[65] = {0};
     compute_hash(g_buf, &count, hash);
 
-    printf("  [%lu] %ls\n", info->Index, info->HardwareId);
+    printf("  [%lu] VID_%04X&PID_%04X&REV_%04X&USB_%04X  class=%02X/%02X/%02X\n",
+           f->Index, f->Vid, f->Pid, f->Rev, f->BcdUSB, f->Cls, f->Sub, f->Proto);
     printf("        基线键: %s\n", key[0] ? key : "(unknown)");
     printf("        条目数: %zu\n", count);
     printf("        指纹:   %s\n", hash);
@@ -337,9 +395,10 @@ int main(int argc, char **argv) {
             "  kmbox               KMBox 判定（鼠标与键盘共享祖父设备）\n"
             "  nodes               HID 节点表快照（10 槽）\n"
             "  list                列出驱动收集到的 USB 设备\n"
+            "  ifaces              GUID 接口表（raw control 用的下标）\n"
             "  debug               驱动内部状态\n"
             "  log                 驱动日志\n"
-            "  scan [--n N] [--verbose]   固件指纹扫描\n"
+            "  scan [--n N] [--verbose]   固件指纹扫描（fuzz + diff）\n"
             "  block <idx>         封锁设备\n"
             "  unblock <idx>       解封设备\n");
         return argc < 2 ? 1 : 0;
@@ -425,6 +484,38 @@ int main(int argc, char **argv) {
         return nl.Count > 0 ? 0 : 2;
     }
 
+    /* ---- ifaces: GUID_DEVINTERFACE_USB_DEVICE 接口表 ---- */
+    if (argc >= 2 && !strcmp(argv[1], "ifaces")) {
+        static IFACE f[16];
+        int nf = probe_ifaces(h, f, 16);
+
+        printf("========== GUID_DEVINTERFACE_USB_DEVICE 接口 ==========\n");
+        printf("可用接口: %d\n", nf);
+        for (int i = 0; i < nf; i++)
+            printf("  iface[%lu]  VID_%04X PID_%04X REV_%04X USB_%04X  class=%02X/%02X/%02X\n",
+                   f[i].Index, f[i].Vid, f[i].Pid, f[i].Rev, f[i].BcdUSB,
+                   f[i].Cls, f[i].Sub, f[i].Proto);
+        if (nf == 0) printf("  (全空 —— 驱动是否加载? IOCTL_USB_RAW_CONTROL 是否可用?)\n");
+        CloseHandle(h);
+        return nf > 0 ? 0 : 2;
+    }
+
+    /* ---- scan: 固件指纹扫描（走 IOCTL_USB_RAW_CONTROL）---- */
+    if (argc >= 2 && !strcmp(argv[1], "scan")) {
+        static IFACE f[16];
+        int nf = probe_ifaces(h, f, 16);
+
+        printf("========== 固件指纹扫描 (probes=%d, ifaces=%d) ==========\n", nprobe, nf);
+        if (nf == 0) {
+            printf("  (没有可用接口 —— 先跑 usb_client ifaces 看驱动通道)\n");
+            CloseHandle(h);
+            return 2;
+        }
+        for (int i = 0; i < nf; i++) scan_one(h, &f[i], nprobe, verbose);
+        CloseHandle(h);
+        return 0;
+    }
+
     static USB_DEV_LIST list;
     int n = enum_devices(h, &list);
     if (n < 0) { fprintf(stderr, "ENUM 失败 (err=%lu)\n", GetLastError()); CloseHandle(h); return 1; }
@@ -439,13 +530,6 @@ int main(int argc, char **argv) {
         }
         CloseHandle(h);
         return n > 0 ? 0 : 2;
-    }
-
-    if (!strcmp(argv[1], "scan")) {
-        printf("========== 固件指纹扫描 (probes=%d) ==========\n", nprobe);
-        for (int i = 0; i < n; i++) scan_one(h, &list.Devs[i], nprobe, verbose);
-        CloseHandle(h);
-        return 0;
     }
 
     if (!strcmp(argv[1], "block") || !strcmp(argv[1], "unblock")) {
