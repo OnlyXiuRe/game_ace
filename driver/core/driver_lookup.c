@@ -199,7 +199,12 @@ NTSTATUS DriverLookupByName(const WCHAR *drvName, PDRIVER_OBJECT *out)
          *   dt nt!_DRIVER_OBJECT obj   如果非 0 看它是不是驱动对象 */
         if (NT_SUCCESS(st) && obj != NULL) {
             *out = (PDRIVER_OBJECT)obj;
-            LOG_INFO("resolved %ws via ObReferenceObjectByName", drvName);
+            /*
+             * 这里不再打 INFO 日志。
+             * DriverScanFindAll 会遍历 \Driver 下全部 127 个条目，
+             * 每条都打一行会把真正有用的输出淹掉（实测 130 行噪音）。
+             * 解析失败仍然打 WARN/ERROR，不影响排查。
+             */
             return STATUS_SUCCESS;
         }
         LOG_WARN("ObReferenceObjectByName(%ws) -> %08X", drvName, st);
@@ -230,7 +235,7 @@ NTSTATUS DriverLookupByName(const WCHAR *drvName, PDRIVER_OBJECT *out)
             *out = dv->DriverObject;
             ObReferenceObject(*out);        /* 增加引用, 调用方负责释放 */
             if (fo) ObDereferenceObject(fo);
-            LOG_INFO("resolved %ws via IoGetDeviceObjectPointer", devPath);
+            /* 同上：不打 INFO，避免扫描时刷屏 */
             return STATUS_SUCCESS;
         }
 

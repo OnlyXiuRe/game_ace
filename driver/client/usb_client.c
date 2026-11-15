@@ -329,6 +329,22 @@ int main(int argc, char **argv) {
     SetConsoleOutputCP(CP_UTF8);
     srand((unsigned)time(NULL));
 
+    /* 无参数 / -h / --help: 只打用法，不需要驱动 */
+    if (argc < 2 || !strcmp(argv[1], "-h") || !strcmp(argv[1], "--help") ||
+        !strcmp(argv[1], "help")) {
+        fprintf(stderr,
+            "用法: usb_client <命令>\n"
+            "  kmbox               KMBox 判定（鼠标与键盘共享祖父设备）\n"
+            "  nodes               HID 节点表快照（10 槽）\n"
+            "  list                列出驱动收集到的 USB 设备\n"
+            "  debug               驱动内部状态\n"
+            "  log                 驱动日志\n"
+            "  scan [--n N] [--verbose]   固件指纹扫描\n"
+            "  block <idx>         封锁设备\n"
+            "  unblock <idx>       解封设备\n");
+        return argc < 2 ? 1 : 0;
+    }
+
     int nprobe = DEFAULT_PROBES, verbose = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--n") && i + 1 < argc) nprobe = atoi(argv[++i]);
@@ -341,6 +357,72 @@ int main(int argc, char **argv) {
     if (h == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "打不开 %ws (err=%lu), 驱动是否已加载?\n", GAME_BASE_WIN32_PATH, GetLastError());
         return 1;
+    }
+
+    /* ================================================================
+     * kmbox / nodes 不依赖设备枚举，放在 ENUM 之前，ENUM 失败也能用
+     * ================================================================ */
+
+    /* ---- kmbox: KMBox 判定（鼠标与键盘共享祖父设备）---- */
+    if (argc >= 2 && !strcmp(argv[1], "kmbox")) {
+        static KMBOX_LIST kl;
+        DWORD ret = 0;
+
+        if (!DeviceIoControl(h, IOCTL_USB_KMBOX, NULL, 0, &kl, sizeof(kl), &ret, NULL)) {
+            printf("KMBOX ioctl 失败 (err=%lu)\n", GetLastError());
+            CloseHandle(h);
+            return 1;
+        }
+
+        printf("========== KMBox 判定 ==========\n");
+        printf("判据: 鼠标节点与键盘节点共享同一个祖父 _DEVICE_NODE\n");
+        printf("命中: %lu\n", kl.Count);
+
+        if (kl.Count == 0) {
+            printf("  (未发现可疑组合 —— 鼠标和键盘挂在不同的祖父设备下)\n");
+        }
+
+        for (ULONG i = 0; i < kl.Count; i++) {
+            const KMBOX_HIT_UM *hit = &kl.Hits[i];
+            printf("\n  [%lu] *** 可疑 ***\n", i);
+            printf("      鼠标: VID_%04X PID_%04X\n", hit->MouseVid, hit->MousePid);
+            printf("            %ls\n", hit->MouseProduct);
+            printf("      键盘: VID_%04X PID_%04X\n", hit->KbdVid, hit->KbdPid);
+            printf("            %ls\n", hit->KbdProduct);
+            printf("      共享祖父设备路径:\n            %ls\n", hit->SharedPath);
+        }
+
+        CloseHandle(h);
+        return kl.Count > 0 ? 0 : 2;
+    }
+
+    /* ---- nodes: HID 节点表快照 ---- */
+    if (argc >= 2 && !strcmp(argv[1], "nodes")) {
+        static HID_NODE_LIST nl;
+        DWORD ret = 0;
+        static const char *tname[] = { "NONE", "KEYBOARD", "MOUSE" };
+
+        if (!DeviceIoControl(h, IOCTL_USB_NODES, NULL, 0, &nl, sizeof(nl), &ret, NULL)) {
+            printf("NODES ioctl 失败 (err=%lu)\n", GetLastError());
+            CloseHandle(h);
+            return 1;
+        }
+
+        printf("========== HID 节点表 (%lu/%d) ==========\n", nl.Count, HID_NODE_MAX_UM);
+        if (nl.Count == 0) {
+            printf("  (空 —— 驱动还没收到 START_DEVICE，或 hub hook 没装上)\n");
+        }
+        for (ULONG i = 0; i < nl.Count; i++) {
+            const HID_NODE_UM *nd = &nl.Nodes[i];
+            const char *tn = (nd->DeviceType <= 2) ? tname[nd->DeviceType] : "?";
+            printf("  [%lu] slot=%-2lu %-9s VID_%04X PID_%04X%s\n",
+                   i, nd->Slot, tn, nd->Vid, nd->Pid,
+                   nd->Blocked ? "  [BLOCKED]" : "");
+            if (nd->InstancePath[0])
+                printf("       路径: %ls\n", nd->InstancePath);
+        }
+        CloseHandle(h);
+        return nl.Count > 0 ? 0 : 2;
     }
 
     static USB_DEV_LIST list;
@@ -424,7 +506,16 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    fprintf(stderr, "用法: usb_client list | debug | log | scan [--n N] [--verbose] | block <idx> | unblock <idx>\n");
+    fprintf(stderr,
+        "用法: usb_client <命令>\n"
+        "  kmbox               KMBox 判定（鼠标与键盘共享祖父设备）\n"
+        "  nodes               HID 节点表快照（10 槽）\n"
+        "  list                列出驱动收集到的 USB 设备\n"
+        "  debug               驱动内部状态\n"
+        "  log                 驱动日志\n"
+        "  scan [--n N] [--verbose]   固件指纹扫描\n"
+        "  block <idx>         封锁设备\n"
+        "  unblock <idx>       解封设备\n");
     CloseHandle(h);
     return 1;
 }

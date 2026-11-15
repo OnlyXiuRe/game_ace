@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="12.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|x64">
@@ -49,7 +49,7 @@
     <SignMode>Off</SignMode>
   </PropertyGroup>
 
-  <!-- Debug: 定义 DBG, 日志宏生效 -->
+  <!-- Debug: 瀹氫箟 DBG, 鏃ュ織瀹忕敓鏁?-->
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
     <ClCompile>
       <TreatWarningAsError>false</TreatWarningAsError>
@@ -65,7 +65,7 @@
     </DriverSign>
   </ItemDefinitionGroup>
 
-  <!-- Release: 不定义 DBG, 日志宏全部展开为空 -->
+  <!-- Release: 涓嶅畾涔?DBG, 鏃ュ織瀹忓叏閮ㄥ睍寮€涓虹┖ -->
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
     <ClCompile>
       <TreatWarningAsError>false</TreatWarningAsError>
@@ -91,6 +91,8 @@
     <ClCompile Include="core\ioctl.c" />
     <ClCompile Include="core\driver_scan.c" />
     <ClCompile Include="core\usb_audit.c" />
+    <ClCompile Include="core\usb_node.c" />
+    <ClCompile Include="core\usb_hub.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\log_types.h" />
@@ -100,6 +102,8 @@
     <ClInclude Include="include\symbol.h" />
     <ClInclude Include="utils\hook\hook.h" />
     <ClInclude Include="core\modules.h" />
+    <ClInclude Include="core\usb_node.h" />
+    <ClInclude Include="core\usb_hub.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
